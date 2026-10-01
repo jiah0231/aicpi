@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, parse, resolve } from "node:path";
@@ -18,6 +19,8 @@ import type { GroundingReviewDetails, GroundingReviewResponse } from "./types";
 import { analyzeGroundingColor } from "./grounding-color";
 import { buildGroundingComparison, GroundingViewRegistry, type GroundingViewDescriptor } from "./grounding-views";
 import { compactGroundingEvidence, validateGroundingWorkingState, type GroundingWorkingState } from "./grounding-evidence";
+import { assessGroundingConstraints, validateGroundingConstraintContract, GROUNDING_CONSTRAINT_LIMITS,
+  type GroundingConstraintContract, type GroundingConstraintAssessment } from "./grounding-constraints";
 
 const EXTENSION_NAME = "pi-web-grounding-safety";
 const GROUNDING_SECTION = "grounding_runtime_safety";
@@ -106,12 +109,16 @@ type GroundingProgress = {
   rawBbox?: [number, number, number, number];
   calibration?: "tiny_target_padding";
   reviewed: true;
+  humanApprovalId?: string;
   reviewSource?: "human" | "runtime_auto" | "model";
   targetFound: boolean;
   candidateCount: number;
   candidateRank?: number;
   expectedOrdinal?: number;
   reason: string;
+  modelContract?: GroundingConstraintContract;
+  constraintAssessment?: GroundingConstraintAssessment;
+  constraintsResolvedByHuman?: boolean;
 };
 
 type GroundingResultInput = {
@@ -126,6 +133,40 @@ type GroundingResultInput = {
   viewId?: string;
 };
 
+
+// Keep these ordinary object/array schemas compatible with OpenAI-style tools;
+// tuple items and top-level oneOf variants break some compatible providers.
+const supportStatusSchema = Type.Union([Type.Literal("supported"), Type.Literal("unresolved"), Type.Literal("contradicted")]);
+const supportEvidenceSchema = Type.String({ minLength: 1, maxLength: GROUNDING_CONSTRAINT_LIMITS.evidenceCharacters });
+const supportSchema = Type.Object({ status: supportStatusSchema, evidence: supportEvidenceSchema });
+const contractIdSchema = Type.String({ minLength: 1, maxLength: GROUNDING_CONSTRAINT_LIMITS.idCharacters });
+const contractTextSchema = Type.String({ minLength: 1, maxLength: GROUNDING_CONSTRAINT_LIMITS.textCharacters });
+const groundingContractSchema = Type.Object({
+  originalQuery: Type.String({ maxLength: GROUNDING_CONSTRAINT_LIMITS.queryCharacters, description: "Exact unmodified query from the loaded record, not a candidate description" }),
+  queryCoverage: supportSchema,
+  candidates: Type.Array(Type.Object({
+    id: contractIdSchema,
+    bbox: Type.Array(Type.Number(), { minItems: 4, maxItems: 4, description: "Full visible-source normalized candidate box" }),
+    identity: Type.Object({ label: contractTextSchema, status: supportStatusSchema, evidence: supportEvidenceSchema,
+      basis: Type.Union([Type.Literal("visual_structure"), Type.Literal("pixel_measurement"), Type.Literal("repeated_view"), Type.Literal("unknown")]) }),
+  }), { maxItems: GROUNDING_CONSTRAINT_LIMITS.candidates }),
+  interpretations: Type.Array(Type.Object({
+    id: contractIdSchema, reading: contractTextSchema, status: supportStatusSchema, evidence: supportEvidenceSchema,
+    requirements: Type.Array(Type.Object({ id: contractIdSchema,
+      queryText: Type.String({ maxLength: GROUNDING_CONSTRAINT_LIMITS.queryExcerptCharacters, description: "Exact excerpt of originalQuery for this requirement" }),
+      description: contractTextSchema, status: supportStatusSchema, evidence: supportEvidenceSchema,
+    }), { maxItems: GROUNDING_CONSTRAINT_LIMITS.requirements }),
+    spatialOrder: Type.Optional(Type.Object({
+      axis: Type.Union([Type.Literal("x"), Type.Literal("y")]),
+      direction: Type.Union([Type.Literal("ascending"), Type.Literal("descending")]),
+      ordinal: Type.Integer({ minimum: 1 }),
+      candidateIds: Type.Array(contractIdSchema, { maxItems: GROUNDING_CONSTRAINT_LIMITS.candidates }),
+      selectedCandidateId: contractIdSchema, candidateSet: supportSchema,
+    })),
+  }), { maxItems: GROUNDING_CONSTRAINT_LIMITS.interpretations }),
+  selectedCandidateId: Type.Optional(contractIdSchema),
+});
+
 type GroundingModality = "visible" | "infrared" | "depth";
 
 type LoadedBatchRecord = {
@@ -137,6 +178,7 @@ type LoadedBatchRecord = {
   currentBbox?: [number, number, number, number];
   settleNudges: number;
   revision?: boolean;
+  humanApprovalId?: string;
   views: GroundingViewRegistry;
   pinnedViewIds: Set<string>;
   archivedViewIds: Set<string>;
@@ -150,6 +192,7 @@ type PersistedGroundingPending = {
   currentBbox?: [number, number, number, number];
   workingState?: GroundingWorkingState;
   revision?: boolean;
+  humanApprovalId?: string;
 };
 
 type GroundingToolContent =
@@ -625,6 +668,11 @@ async function readGroundingProgress(path: string): Promise<Map<string, Groundin
         + "or delete that file first if its saved results are not needed.",
       );
     }
+    if (item.reviewSource === "runtime_auto" || item.reviewSource === "model") {
+      throw new Error(`Grounding progress ${item.key} was not human-approved (${item.reviewSource}); it cannot count as an approved result. The existing files are unchanged. Use a new output directory or explicitly review a migration of these legacy results.`);
+    }
+    // Older human-gated records omitted reviewSource; retain that schema's
+    // reviewed:true compatibility, but never accept explicit auto/model origin.
     progress.set(item.key, item as GroundingProgress);
   }
   return progress;
@@ -653,27 +701,40 @@ function validateBoundingBox(value: readonly number[]): [number, number, number,
   }
   return [value[0], value[1], value[2], value[3]];
 }
+// Legacy UI hint only, never a query interpreter. Multiple distinct ordinal
+// tokens have no single safe default (e.g. "second first"). New contracts keep
+// the model's alternative readings explicitly instead of choosing one here.
 export function expectedGroundingOrdinal(query: string): number | undefined {
-  const chinese = /(?:第)\s*(\d+)/u.exec(query);
-  if (chinese) return Number(chinese[1]);
-  const numeric = /\b(\d+)(?:st|nd|rd|th)\b/i.exec(query);
-  if (numeric) return Number(numeric[1]);
-  const words: Record<string, number> = {
-    first: 1,
-    second: 2,
-    third: 3,
-    fourth: 4,
-    fifth: 5,
-    sixth: 6,
-    seventh: 7,
-    eighth: 8,
-    ninth: 9,
-    tenth: 10,
-  };
-  for (const [word, ordinal] of Object.entries(words)) {
-    if (new RegExp(`\\b${word}\\b`, "i").test(query)) return ordinal;
+  const ordinals = new Set<number>();
+  for (const match of query.matchAll(/第\s*(\d+)|\b(\d+)(?:st|nd|rd|th)\b/giu)) ordinals.add(Number(match[1] ?? match[2]));
+  const words: Record<string, number> = { first: 1, second: 2, third: 3, fourth: 4, fifth: 5,
+    sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10 };
+  for (const match of query.matchAll(/\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b/giu)) {
+    ordinals.add(words[match[1].toLowerCase()]);
   }
-  return undefined;
+  return ordinals.size === 1 ? [...ordinals][0] : undefined;
+}
+function assessOriginalQueryConstraints(
+  contract: GroundingConstraintContract | undefined,
+  originalQuery: string,
+  bbox?: readonly number[],
+): GroundingConstraintAssessment {
+  const assessment = assessGroundingConstraints(contract, originalQuery, bbox);
+  const ordinalHint = expectedGroundingOrdinal(originalQuery);
+  if (!contract || ordinalHint === undefined) return assessment;
+  // This narrow existing hint can catch an omitted/changed numeric constraint;
+  // it does not parse direction, identity, or the meaning of ambiguous text.
+  const plausible = contract.interpretations.filter((reading) => reading.status !== "contradicted");
+  for (const reading of plausible) {
+    const order = reading.spatialOrder;
+    if (order && order.ordinal === ordinalHint) continue;
+    assessment.issues.push({ code: order ? "original_ordinal_mismatch" : "missing_spatial_order",
+      message: order ? `Original query contains the unambiguous ordinal hint ${ordinalHint}, but reading ${reading.id} declares ${order.ordinal}. Preserve the original requirement.`
+        : `Original query contains ordinal hint ${ordinalHint}, but reading ${reading.id} has no spatialOrder. Declare the comparable candidate set and query direction, or keep this reading unresolved for human review.` });
+    assessment.canLock = false;
+    assessment.status = order ? "contradicted" : assessment.status === "contradicted" ? "contradicted" : "unresolved";
+  }
+  return assessment;
 }
 type ConfirmedGroundingReview = Extract<GroundingReviewResponse, { action: "confirm" }>;
 export function validateGroundingReviewResponse(
@@ -714,7 +775,8 @@ export function validateGroundingReviewResponse(
   }
   const candidateRank = input.candidateRank;
   if (targetFound && candidateCount < 1) throw new Error("A found target requires at least one candidate.");
-  if (targetFound && (typeof candidateRank !== "number" || !Number.isInteger(candidateRank) || candidateRank < 1 || candidateRank > candidateCount)) {
+  if (targetFound && (candidateRank !== undefined || details.expectedOrdinal !== undefined)
+    && (typeof candidateRank !== "number" || !Number.isInteger(candidateRank) || candidateRank < 1 || candidateRank > candidateCount)) {
     throw new Error("Browser grounding review candidate rank is outside the candidate count.");
   }
   if (!targetFound && status !== "unresolved") throw new Error("A missing target can only be saved as unresolved.");
@@ -725,6 +787,10 @@ export function validateGroundingReviewResponse(
   if (typeof input.reason !== "string" || input.reason.trim().length < 8) {
     throw new Error("Browser grounding review must include an evidence reason of at least 8 characters.");
   }
+  if (details.constraintAssessment && !details.constraintAssessment.canLock
+    && (status !== "unresolved" || confidence > 0.49) && input.constraintsResolved !== true) {
+    throw new Error("Unresolved query/identity checks must remain unresolved at confidence <= 0.49, unless the human reviewer explicitly confirms they resolved the listed issues from the image and original query.");
+  }
   const confirmed: ConfirmedGroundingReview = {
     type: "grounding_review_response",
     action: "confirm",
@@ -733,7 +799,8 @@ export function validateGroundingReviewResponse(
     confidence,
     targetFound,
     candidateCount,
-    ...(targetFound ? { candidateRank: candidateRank as number } : {}),
+    ...(targetFound && candidateRank !== undefined ? { candidateRank: candidateRank as number } : {}),
+    ...(input.constraintsResolved === true ? { constraintsResolved: true } : {}),
     reason: input.reason.trim(),
   };
   return confirmed;
@@ -1484,6 +1551,74 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       let lastApprovedKey: string | undefined;
       let toolsBeforeBatch: string[] | undefined;
       let persistedPending: PersistedGroundingPending | undefined;
+      let jobRestoreWarning: string | undefined;
+
+      // Only approved keys in this dataset count. Re-read this durable ledger
+      // after restart and before/after saving; wrapper-local increments drift
+      // when a pending record is saved directly after reconstruction.
+      const reconcileJobProgress = (state: SanitizedQueryState, progress: Map<string, GroundingProgress>) => {
+        const keys = Object.keys(state.safe);
+        const completed = keys.filter((key) => progress.has(key)).length;
+        jobStartCompleted ??= completed;
+        sessionSavedCount = Math.max(0, completed - jobStartCompleted);
+        batchToolStarted = true;
+        jobRestoreWarning = undefined;
+        if (persistedPending && (!state.safe[persistedPending.key]
+          || progress.has(persistedPending.key) && (!persistedPending.revision
+            || persistedPending.humanApprovalId !== undefined && progress.get(persistedPending.key)?.humanApprovalId === persistedPending.humanApprovalId))) persistedPending = undefined;
+        const hasPending = loadedBatchRecords.size > 0 || persistedPending !== undefined;
+        batchExhausted = !hasPending && (completed === keys.length
+          || requestedRecordLimit !== undefined && sessionSavedCount >= requestedRecordLimit);
+        return completed;
+      };
+
+      const groundingArtifactPlan = (state: SanitizedQueryState, progress: Map<string, GroundingProgress>, outputDirectory: string) => {
+        const keys = Object.keys(state.safe);
+        const orderedProgress = keys.map((key) => progress.get(key)).filter((item): item is GroundingProgress => item !== undefined);
+        const submission: Record<string, unknown> = {};
+        for (const result of orderedProgress) {
+          const original = state.source[result.key];
+          if (!original || typeof original !== "object" || Array.isArray(original)) continue;
+          const record = { ...(original as Record<string, unknown>) };
+          delete record.bbox;
+          submission[result.key] = { ...record, bbox: result.bbox };
+        }
+        return { orderedProgress, complete: orderedProgress.length === keys.length,
+          submissionText: `${JSON.stringify(submission, null, 2)}\n`,
+          submissionPath: join(outputDirectory, "queries.json"), archivePath: join(outputDirectory, "queries.zip") };
+      };
+
+      // The ledger is the approval boundary; JSON/ZIP are recoverable derived
+      // artifacts. Read-only status/restoration reports incomplete artifacts.
+      // Explicit continuation/save retry can repair only these owned outputs,
+      // using approved rows verbatim, without a second review or approval count.
+      const reconcileGroundingArtifacts = async (state: SanitizedQueryState, progress: Map<string, GroundingProgress>, outputDirectory: string, repair = false) => {
+        const plan = groundingArtifactPlan(state, progress, outputDirectory);
+        if (plan.orderedProgress.length === 0) return;
+        let submissionMatches = false;
+        let archiveMatches = !plan.complete;
+        try { submissionMatches = await readFile(plan.submissionPath, "utf8") === plan.submissionText; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        if (plan.complete) {
+          try {
+            const archive = await JSZip.loadAsync(await readFile(plan.archivePath));
+            archiveMatches = await archive.file(QUERY_FILE)?.async("string") === plan.submissionText;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            // Missing or corrupt derived ZIP can be regenerated from the ledger.
+          }
+        }
+        if (submissionMatches && archiveMatches) return;
+        if (!repair) return "Approved progress is saved, but derived submission JSON/ZIP is missing or stale. Call grounding_next_batch to repair the owned output artifacts without reapproving or recounting records; do not claim output completion yet.";
+        await mkdir(outputDirectory, { recursive: true });
+        if (!submissionMatches) await writeFileAtomic(plan.submissionPath, plan.submissionText, options.sessionId);
+        if (!archiveMatches) {
+          const archive = new JSZip();
+          archive.file(QUERY_FILE, plan.submissionText);
+          const bytes = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 9 } });
+          await writeBufferAtomic(plan.archivePath, bytes, options.sessionId);
+        }
+      };
 
       const loadedRecord = (
         sourcePath: string,
@@ -1495,6 +1630,11 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         if (record.visible) grantedModalities.add("visible");
         if (record.infrared && INFRARED_QUERY.test(record.query ?? "")) grantedModalities.add("infrared");
         if (record.depth && DEPTH_QUERY.test(record.query ?? "")) grantedModalities.add("depth");
+        let workingState = pending?.workingState;
+        if (workingState?.selection?.status === "locked"
+          && !assessOriginalQueryConstraints(workingState.contract, record.query ?? "", workingState.selection.bbox).canLock) {
+          workingState = { ...workingState, selection: { ...workingState.selection, status: "reconsidering" } };
+        }
         return {
           sourcePath,
           outputDirectory,
@@ -1502,8 +1642,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           grantedModalities,
           settleNudges: 0,
           ...(pending?.currentBbox ? { currentBbox: pending.currentBbox } : {}),
-          ...(pending?.workingState ? { workingState: pending.workingState } : {}),
+          ...(workingState ? { workingState } : {}),
           ...(pending?.revision ? { revision: true } : {}),
+          ...(pending?.humanApprovalId ? { humanApprovalId: pending.humanApprovalId } : {}),
           ...recordEvidence(),
         };
       };
@@ -1516,6 +1657,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             ...(current[1].currentBbox ? { currentBbox: current[1].currentBbox } : {}),
             ...(current[1].workingState ? { workingState: current[1].workingState } : {}),
             ...(current[1].revision ? { revision: true } : {}),
+            ...(current[1].humanApprovalId ? { humanApprovalId: current[1].humanApprovalId } : {}),
           };
         }
         if (lastJob) pi.appendEntry?.("grounding:job", { version: 2, ...lastJob, targetCount: requestedRecordLimit,
@@ -1530,6 +1672,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           currentKey: pendingKey ?? null, lastApprovedKey: lastApprovedKey ?? null,
           pendingCorrectionKey: pendingRevision ? pendingKey ?? null : null,
           reviewStatus: savingRecord ? "awaiting_review_or_saving" : pendingKey ? "awaiting_prediction" : "idle",
+          completionReached: batchExhausted && !jobRestoreWarning,
+          ...(jobRestoreWarning ? { restorationWarning: jobRestoreWarning } : {}),
           requestedLimitReached: requestedRecordLimit !== undefined && sessionSavedCount >= requestedRecordLimit };
       };
 
@@ -1663,9 +1807,12 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         }
         lastJob = { queryPath: sourcePath, outputDir: outputDirectory };
         const progressPath = join(outputDirectory, "progress.jsonl");
-        const completed = await readGroundingProgress(progressPath);
-        jobStartCompleted ??= completed.size;
-        sessionSavedCount = Math.max(0, completed.size - jobStartCompleted);
+        const completed = await withFileMutationQueue(progressPath, async () => {
+          const progress = await readGroundingProgress(progressPath);
+          await reconcileGroundingArtifacts(state, progress, outputDirectory, true);
+          return progress;
+        });
+        const completedCount = reconcileJobProgress(state, completed);
         requestedCountPending = false;
         let current: [string, LoadedBatchRecord] | undefined;
         const requestedLimitReached = requestedRecordLimit !== undefined && sessionSavedCount >= requestedRecordLimit;
@@ -1694,9 +1841,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         const record = current ? { key: current[0], ...current[1].record } : null;
         const payload = {
           records: record ? [record] : [],
-          completed: completed.size,
+          completed: completedCount,
           total,
-          remaining: Math.max(0, total - completed.size),
+          remaining: Math.max(0, total - completedCount),
           outputDir: outputDirectory,
           requestedLimitReached,
           targetCount: requestedRecordLimit ?? null,
@@ -1730,7 +1877,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         persistJob();
         return {
           content,
-          details: { records: payload.records, completed: completed.size, total, images: imageDetails,
+          details: { records: payload.records, completed: completedCount, total, images: imageDetails,
             requestedLimitReached, job: jobSnapshot() },
           payload,
         };
@@ -1763,6 +1910,20 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           throw new Error("Use the same output directory that loaded this record; do not change it during review.");
         }
         const completed = await readGroundingProgress(join(outputDirectory, "progress.jsonl"));
+        reconcileJobProgress(state, completed);
+        if (completed.has(params.key) && (!loaded.revision
+          || loaded.humanApprovalId !== undefined && completed.get(params.key)?.humanApprovalId === loaded.humanApprovalId)) {
+          const recovered = await withFileMutationQueue(join(outputDirectory, "progress.jsonl"), async () => {
+            const progress = await readGroundingProgress(join(outputDirectory, "progress.jsonl"));
+            await reconcileGroundingArtifacts(state, progress, outputDirectory, true);
+            return progress;
+          });
+          loadedBatchRecords.delete(params.key);
+          persistedPending = undefined;
+          reconcileJobProgress(state, recovered);
+          persistJob();
+          throw new Error("This record already has an approved result; its derived output artifacts have been reconciled without another approval. Use grounding_status, then grounding_reopen_record for an explicitly requested correction; do not save a stale pending prediction again.");
+        }
         const coordinateSpace = params.coordinateSpace ?? "source";
         const mappedView = coordinateSpace === "view_pixels" || coordinateSpace === "view_normalized";
         if (mappedView && !params.viewId) throw new Error("viewId is required for view_pixels or view_normalized coordinates.");
@@ -1796,7 +1957,24 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         if (typeof params.reason !== "string" || params.reason.trim().length < 8) {
           throw new Error("Provide a short visible-evidence reason of at least 8 characters before requesting review.");
         }
+        if (!["ok", "low_confidence", "unresolved"].includes(params.status)
+          || !Number.isFinite(params.confidence) || params.confidence < 0 || params.confidence > 1) {
+          throw new Error("Provide a valid grounding status and finite confidence between 0 and 1.");
+        }
         const rawBbox = proposedBbox;
+        const constraintAssessment = assessOriginalQueryConstraints(loaded.workingState?.contract, loaded.record.query ?? "", rawBbox);
+        const unresolved = !constraintAssessment.canLock;
+        const reviewStatus = unresolved ? "unresolved" : params.status;
+        const reviewConfidence = unresolved || params.status === "unresolved"
+          ? Math.min(params.confidence, 0.49) : params.confidence;
+        const contract = loaded.workingState?.contract;
+        const activeReadings = contract?.interpretations.filter((item) => item.status !== "contradicted") ?? [];
+        const order = activeReadings.length === 1
+          ? constraintAssessment.orders.find((item) => item.interpretationId === activeReadings[0].id) : undefined;
+        // Only an unambiguous declared reading supplies the review ordinal.
+        // Legacy lexical hints must never silently choose between two readings.
+        const expectedOrdinal = order?.ordinal ?? (!contract ? expectedGroundingOrdinal(loaded.record.query ?? "") : undefined);
+        const candidateCount = order?.possibleCount ?? contract?.candidates.filter((item) => item.identity.status !== "contradicted").length ?? 0;
         // The browser draws the editable box. Baked-in hypothesis pixels would
         // leave a second, stale box visible after a manual edit.
         const visibleImage = await loadGroundingImage(sourcePath, loaded.record, "visible", readRecordImage, null, false);
@@ -1814,12 +1992,16 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           query: loaded.record.query ?? "",
           bbox: rawBbox,
           ...(candidateChange ? { previousBbox: candidateChange.previousBbox, candidateChange } : {}),
-          status: params.status,
-          confidence: params.confidence,
-          targetFound: params.status !== "unresolved",
-          candidateCount: 1,
-          candidateRank: params.status === "unresolved" ? undefined : 1,
-          expectedOrdinal: expectedGroundingOrdinal(loaded.record.query ?? ""),
+          status: reviewStatus,
+          confidence: reviewConfidence,
+          targetFound: !unresolved && params.status !== "unresolved",
+          candidateCount,
+          candidateRank: order?.selectedRank ?? (candidateCount === 1 && !unresolved ? 1 : undefined),
+          expectedOrdinal,
+          constraintAssessment,
+          ...(contract ? { modelContract: contract } : {}),
+          ...(reviewStatus !== params.status || reviewConfidence !== params.confidence
+            ? { modelProposal: { status: params.status, confidence: params.confidence } } : {}),
           reason: params.reason.trim(),
           image: reviewImageFromGroundingImage(visibleImage),
           availableModalities: Array.from(loaded.grantedModalities),
@@ -1840,6 +2022,10 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         signal?.throwIfAborted();
         const bbox = review.bbox;
         loaded.currentBbox = bbox;
+        // Persist the review identity before the ledger write. After a crash,
+        // a matching human-approved row also clears a pending revision safely.
+        const humanApprovalId = randomUUID();
+        loaded.humanApprovalId = humanApprovalId;
         persistJob();
         const status = review.status;
         const confidence = review.confidence;
@@ -1852,10 +2038,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           bbox,
           `${params.key} | ${status} ${confidence.toFixed(2)}`,
         );
-        // Small targets are the ones a full frame cannot show reliably, so the
-        // runtime re-inspects them itself instead of trusting the model to ask for
-        // a crop. This is a runtime safety artifact and does not consume or
-        // restrict the model's crop requests.
+        // This post-approval magnified artifact helps the user inspect a small
+        // box. It is not another independent observation or an identity check,
+        // and never raises confidence or bypasses the earlier human gate.
         const verification = verificationRegionFor(bbox);
         const verifyCrop = verification
           ? await loadGroundingCrop(sourcePath, loaded.record, "visible", verification, bbox, readRecordImage)
@@ -1879,44 +2064,36 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             confidence,
             bbox,
             reviewed: true,
+            humanApprovalId,
             targetFound: review.targetFound,
             candidateCount: review.candidateCount,
             ...(review.candidateRank !== undefined ? { candidateRank: review.candidateRank } : {}),
             ...(reviewDetails.expectedOrdinal !== undefined ? { expectedOrdinal: reviewDetails.expectedOrdinal } : {}),
             reason: review.reason,
             reviewSource: "human",
+            ...(contract ? { modelContract: contract } : {}),
+            constraintAssessment,
+            ...(review.constraintsResolved === true ? { constraintsResolvedByHuman: true } : {}),
           });
 
-          const orderedProgress = Object.keys(state.safe)
-            .map((key) => progress.get(key))
-            .filter((item): item is GroundingProgress => item !== undefined);
-          const progressText = orderedProgress.map((item) => JSON.stringify(item)).join("\n");
+          const plan = groundingArtifactPlan(state, progress, outputDirectory);
+          const progressText = plan.orderedProgress.map((item) => JSON.stringify(item)).join("\n");
           await writeFileAtomic(progressPath, progressText ? `${progressText}\n` : "", options.sessionId);
-
-          const submission: Record<string, unknown> = {};
-          for (const key of Object.keys(state.safe)) {
-            const result = progress.get(key);
-            if (!result) continue;
-            const original = state.source[key];
-            if (!original || typeof original !== "object" || Array.isArray(original)) continue;
-            const originalWithoutBbox = { ...(original as Record<string, unknown>) };
-            delete originalWithoutBbox.bbox;
-            submission[key] = { ...originalWithoutBbox, bbox: result.bbox };
+          try {
+            await reconcileGroundingArtifacts(state, progress, outputDirectory, true);
+          } catch (error) {
+            // Approval is already durable. Clear the pending review, retain its
+            // count once, and make artifact-only retry available immediately.
+            lastApprovedKey = params.key;
+            loadedBatchRecords.delete(params.key);
+            persistedPending = undefined;
+            reconcileJobProgress(state, progress);
+            jobRestoreWarning = `Human approval is saved, but output artifact generation failed: ${(error as Error).message}. Call grounding_next_batch to repair outputs without reviewing this record again.`;
+            persistJob();
+            throw new Error(jobRestoreWarning);
           }
-          const submissionText = `${JSON.stringify(submission, null, 2)}\n`;
-          await writeFileAtomic(submissionPath, submissionText, options.sessionId);
-
-          const complete = orderedProgress.length === Object.keys(state.safe).length;
-          if (complete) {
-            const archive = new JSZip();
-            archive.file(QUERY_FILE, submissionText);
-            const archiveBuffer = await archive.generateAsync({
-              type: "nodebuffer",
-              compression: "DEFLATE",
-              compressionOptions: { level: 9 },
-            });
-            await writeBufferAtomic(archivePath, archiveBuffer, options.sessionId);
-          }
+          const complete = plan.complete;
+          const orderedProgress = plan.orderedProgress;
           return {
             saved: params.key,
             processed: orderedProgress.length,
@@ -1927,10 +2104,15 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           };
         });
         const revision = loaded.revision === true;
-        if (batchMode && !revision) sessionSavedCount += 1;
         lastApprovedKey = params.key;
         loadedBatchRecords.delete(params.key);
         persistedPending = undefined;
+        // The successful atomic write, not a tool call or a UI opening, is the
+        // completion boundary. Revisions never add a second approval count.
+        sessionSavedCount = Math.max(0, summary.processed - (jobStartCompleted ?? summary.processed));
+        batchToolStarted = true;
+        batchExhausted = summary.processed === summary.total
+          || requestedRecordLimit !== undefined && sessionSavedCount >= requestedRecordLimit;
         persistJob();
         return { summary, overlay, verificationContent, revision };
       };
@@ -1954,7 +2136,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       pi.registerTool({
         name: "grounding_next_batch",
         label: "Grounding next record",
-        description: "Load exactly one unfinished sanitized grounding record and attach its needed image modalities, starting with visible. The first image explicitly states when no current hypothesis exists.",
+        description: "Load exactly one unfinished sanitized grounding record and attach its needed image modalities, starting with visible. The first image explicitly states when no current hypothesis exists. Also repairs missing/stale derived submission JSON/ZIP from approved progress without another approval.",
         promptSnippet: "Load the next unfinished grounding record with its visible image and explicit hypothesis state",
         promptGuidelines: [
           "For a query dataset, call grounding_next_batch once to load the next record instead of reading queries.json directly.",
@@ -2038,7 +2220,10 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const completed = entries.filter(([key]) => progress.has(key)).length;
           lastJob ??= { queryPath: sourcePath, outputDir };
           const sameJob = normalizePath(lastJob.queryPath) === normalizePath(sourcePath) && normalizePath(lastJob.outputDir) === normalizePath(outputDir);
-          if (sameJob && jobStartCompleted !== undefined) sessionSavedCount = Math.max(0, completed - jobStartCompleted);
+          if (sameJob) {
+            reconcileJobProgress(state, progress);
+            jobRestoreWarning = await reconcileGroundingArtifacts(state, progress, outputDir);
+          }
           const offset = params.offset ?? 0;
           const records = entries.slice(offset, offset + (params.limit ?? 20)).map(([key, record]) => {
             const loaded = loadedBatchRecords.get(key);
@@ -2046,7 +2231,18 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
               && normalizePath(loaded.outputDirectory) === normalizePath(outputDir);
             return { key, query: record.query,
               state: belongsHere ? "awaiting_prediction_or_review" : progress.has(key) ? "approved" : "unfinished",
-              ...(progress.has(key) ? { approvedPrediction: progress.get(key) } : {}) };
+              ...(progress.has(key) ? { approvedPrediction: (() => {
+                const saved = progress.get(key)!;
+                // A 20-row status page must not repeat 20 full evidence
+                // contracts alongside the active image payload. Full evidence
+                // remains in the ledger and is available on explicit reopen.
+                return { key: saved.key, status: saved.status, confidence: saved.confidence, bbox: saved.bbox,
+                  targetFound: saved.targetFound, candidateCount: saved.candidateCount, candidateRank: saved.candidateRank,
+                  expectedOrdinal: saved.expectedOrdinal, reason: saved.reason, reviewed: saved.reviewed, reviewSource: saved.reviewSource,
+                  ...(saved.constraintAssessment ? { constraintStatus: saved.constraintAssessment.status,
+                    unresolvedCheckCount: saved.constraintAssessment.issues.length } : {}),
+                  ...(saved.constraintsResolvedByHuman ? { constraintsResolvedByHuman: true } : {}) };
+              })() } : {}) };
           });
           const details = { queryPath: sourcePath, outputDir, completed, total: entries.length,
             remaining: entries.length - completed, records, nextOffset: offset + records.length < entries.length ? offset + records.length : null,
@@ -2168,6 +2364,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         promptGuidelines: [
           "facts must contain only direct visible observations. Put interpretations such as 'this dark line is the beak' in hypotheses until structural evidence verifies the object and part. A color match alone never promotes a hypothesis to a fact.",
           "Keep the original query and the user's target requirements intact in state.target; put changing candidate identities in hypotheses, not in place of the requested target. Record hypotheses, open questions and ruled-out candidates concisely, not private deliberation. Before another substantially overlapping view, state what remains unresolved and what visible result would confirm or reject the hypothesis.",
+          "Before locking or submitting, record state.contract: exact originalQuery, queryCoverage, all plausible interpretations and their requirements tied to verbatim queryText, candidate IDs/source boxes and identity evidence. Keep unclear or conflicting readings separately, for example first vs second in 'second first'; never silently pick one. A queryCoverage claim is your evidence declaration, not a machine proof.",
+          "For ordered targets each interpretation declares spatialOrder axis (x/y), direction (ascending is left-to-right/top-to-bottom, descending the reverse), ordinal and candidateIds. Keep the total serialized contract at most 32 KiB and queryText excerpts at most 600 characters; shorten evidence, never the original query. The runtime sorts source centers independently of discovery/array order. Declare candidateSet unresolved if membership/count is uncertain. Identity basis is visual_structure only for actual visible structure; repeated_view/pixel_measurement cannot prove identity. Alternatives rejected by evidence stay as contradicted interpretations.",
+          "Missing or unresolved contracts stay reviewable as unresolved at low confidence; no extra color/crop call is required. Unsupported locks are returned as reconsidering with explicit constraintAssessment issues. Fix only what current evidence supports; never fabricate evidence to clear a check.",
           "As soon as identity and every required order/relation are established, set state.selection to locked with a rough source-normalized bbox and direct evidence. Locked means no identity or rank check remains; it is not a tentative pick. This limits later views to target boundary measurement. Use reconsidering while comparison is still needed or after naming new visible counterevidence; a generic possibility of hidden candidates is not counterevidence.",
           "Archive only superseded or redundant views after keeping the evidence and counterexamples that matter. Pin overrides archive; the record's original overview stays available. For a comparison image, every panel viewId must be archived before that whole image is omitted.",
         ],
@@ -2178,6 +2377,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           restore: Type.Optional(Type.Array(Type.String(), { maxItems: 100 })),
           unpin: Type.Optional(Type.Array(Type.String(), { maxItems: 100 })),
           state: Type.Optional(Type.Object({ target: Type.Optional(Type.String({ maxLength: 600 })),
+            contract: Type.Optional(groundingContractSchema),
             facts: Type.Optional(Type.Array(Type.String({ maxLength: 400 }), { maxItems: 8 })),
             hypotheses: Type.Optional(Type.Array(Type.String({ maxLength: 400 }), { maxItems: 8 })),
             openQuestions: Type.Optional(Type.Array(Type.String({ maxLength: 400 }), { maxItems: 8 })),
@@ -2193,7 +2393,13 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         executionMode: "sequential",
         async execute(_id, params) {
           const [key, loaded] = resolveLoadedRecord(params);
-          const state = params.state === undefined ? loaded.workingState : validateGroundingWorkingState(params.state);
+          let state = params.state === undefined ? loaded.workingState : validateGroundingWorkingState(params.state);
+          if (state?.contract) validateGroundingConstraintContract(state.contract, loaded.record.query ?? "");
+          const constraintAssessment = assessOriginalQueryConstraints(state?.contract, loaded.record.query ?? "", state?.selection?.bbox);
+          const lockDeferred = state?.selection?.status === "locked" && !constraintAssessment.canLock;
+          if (lockDeferred && state?.selection) {
+            state = { ...state, selection: { ...state.selection, status: "reconsidering" } };
+          }
           for (const id of [...(params.pin ?? []), ...(params.unpin ?? []), ...(params.archive ?? []), ...(params.restore ?? [])]) {
             if (!loaded.views.get(id)) throw new Error(`Unknown viewId ${id} for this record. List the current record's views first.`);
           }
@@ -2203,7 +2409,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           for (const id of params.pin ?? []) loaded.pinnedViewIds.add(id);
           loaded.workingState = state;
           if (params.state !== undefined) loaded.evidenceRevision += 1;
-          if (state?.selection?.status === "locked" && state.selection.bbox) {
+          if (state?.selection?.bbox) {
             loaded.currentBbox = [...state.selection.bbox];
           } else if (state?.selection?.status === "reconsidering") {
             loaded.currentBbox = undefined;
@@ -2213,7 +2419,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const offset = params.offset ?? 0;
           const views = all.slice(offset, offset + (params.limit ?? 20)).map((view) => ({ ...view,
             pinned: loaded.pinnedViewIds.has(view.id), archived: loaded.archivedViewIds.has(view.id) && !loaded.pinnedViewIds.has(view.id) }));
-          const details = { key, ...groundingTargetReminder(loaded), state: state ?? {}, views, totalViews: all.length,
+          const details = { key, ...groundingTargetReminder(loaded), state: state ?? {}, constraintAssessment, lockDeferred, views, totalViews: all.length,
             nextOffset: offset + views.length < all.length ? offset + views.length : null,
             note: "Facts are direct observations; hypotheses are unverified object/part interpretations. A selected target limits later views to its region; set selection to reconsidering only when new visible counterevidence requires reopening identity. Color membership never establishes identity. Only explicitly archived image payloads leave subsequent model input; use grounding_view with viewId to inspect a source region again." };
           return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
@@ -2299,6 +2505,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Use one or more focus crops when the target is small, ambiguous, or needs closer inspection. You decide whether to crop, how many crops to request, and the zoom for each crop. The runtime does not force a crop before saving.",
           "Do not tile the image to rule out merely hypothetical hidden candidates. For an ordinal query, use the overview as the common ordering frame; once enough visible candidates establish the requested rank, record state.selection and stop inspecting candidates that cannot change that rank.",
           "After state.selection is locked, further crops must intersect that candidate and answer a boundary or requested-part question. To switch candidates, first set selection to reconsidering in grounding_evidence and name the new visible counterevidence; uncertainty by itself is not a reason to restart the search.",
+          "To recall the same region, use viewId without region. To crop within that displayed view, provide viewId + region + coordinateSpace view_normalized or view_pixels. For a new full-source region omit viewId, or explicitly use coordinateSpace source. Never assume crop-local numbers are source coordinates.",
           "For a box read from this display, use its viewId and coordinateSpace view_pixels or view_normalized. Source grid numbers already use source coordinates. last_crop is legacy and refers only to the latest crop.",
           "When repeatedSourceViewId is returned, these source pixels were already examined; explain what new question another rendering answers. Use grounding_compare for identity ambiguity and grounding_evidence to retain facts and archive redundant views, without a fixed crop count.",
           "A crop that reaches the source image border reports touchesSourceEdge, which means no margin exists on that side; do not assume hidden context beyond the reported crop span.",
@@ -2307,7 +2514,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           queryPath: Type.Optional(Type.String({ description: "Source queries.json; defaults to the loaded record's dataset" })),
           key: Type.Optional(Type.String({ description: "Record key; defaults to the currently loaded record" })),
           modality: Type.Optional(Type.String({ description: "visible (default), infrared, or depth" })),
-          viewId: Type.Optional(Type.String({ description: "Recall an earlier source region from this record; do not also specify region. A fresh viewId will describe the newly rendered display." })),
+          viewId: Type.Optional(Type.String({ description: "Without region, recall this view. With region, coordinateSpace must explicitly say source, view_normalized or view_pixels. The new display receives a fresh viewId." })),
+          coordinateSpace: Type.Optional(Type.Union([Type.Literal("source"), Type.Literal("view_normalized"), Type.Literal("view_pixels")], { description: "Coordinate frame for region only; bbox always stays source-normalized. Required when viewId and region are both supplied." })),
           decorations: Type.Optional(Type.Union([Type.Literal("none"), Type.Literal("grid"), Type.Literal("hypothesis"), Type.Literal("all")])),
           bbox: Type.Optional(Type.Array(Type.Number(), {
             minItems: 4,
@@ -2318,7 +2526,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           region: Type.Optional(Type.Array(Type.Number(), {
             minItems: 4,
             maxItems: 4,
-            description: "Optional source-normalized crop region [x1,y1,x2,y2]; may inspect only a small part of bbox. The current hypothesis remains in full source coordinates.",
+            description: "Crop [x1,y1,x2,y2] in source coordinates by default. With viewId, explicitly declare coordinateSpace; view coordinates are mapped automatically. May inspect only a small part of bbox.",
           })),
           reason: Type.String({ description: "Concrete reason this additional view is needed" }),
         }),
@@ -2329,7 +2537,12 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const targetReminder = groundingTargetReminder(loaded);
           const recalled = params.viewId ? loaded.views.get(params.viewId) : undefined;
           if (params.viewId && !recalled) throw new Error("Unknown or stale viewId. List current record views with grounding_evidence, or request a new region.");
-          if (recalled && params.region) throw new Error("Use either viewId or region, not both.");
+          if (recalled && params.region && !params.coordinateSpace) {
+            throw new Error("viewId + region needs an explicit coordinateSpace. Retry with coordinateSpace view_normalized (0..1 on the displayed view), view_pixels (display pixels), or source (full-image normalized). To recall the unchanged view, omit region. bbox always uses source coordinates.");
+          }
+          if (params.coordinateSpace && params.coordinateSpace !== "source" && (!recalled || !params.region)) {
+            throw new Error("view_normalized/view_pixels requires both viewId and region. For an unchanged recall use only viewId; for a source crop use region and zoom.");
+          }
           if (recalled && params.modality && params.modality !== recalled.modality) throw new Error("The requested modality does not match this viewId.");
           const modality = recalled?.modality ?? params.modality ?? "visible";
           if (!(modality === "visible" || modality === "infrared" || modality === "depth")) {
@@ -2351,7 +2564,10 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const { sourcePath } = await loadQueryState(params.queryPath ?? loaded.sourcePath);
           if (loaded.sourcePath !== sourcePath) throw new Error("The requested queryPath does not match the loaded record.");
 
-          const requestedRegion = params.region ?? (recalled && !recalled.region.every((value, index) => value === [0, 0, 1, 1][index]) ? recalled.region : undefined);
+          const mappedRegion = params.region && recalled && params.coordinateSpace && params.coordinateSpace !== "source"
+            ? loaded.views.toSource(recalled.id, params.region, params.coordinateSpace)
+            : params.region;
+          const requestedRegion = mappedRegion ?? (recalled && !recalled.region.every((value, index) => value === [0, 0, 1, 1][index]) ? recalled.region : undefined);
           if (selected && !requestedRegion && modality === "visible" && loaded.grantedModalities.has("visible")) {
             throw new Error(
               "The visible overview is already available and the target is selected. Inspect a crop intersecting that target or submit it for review.",
@@ -2445,6 +2661,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Prefer grounding_save_and_next between requested records; use grounding_save_result for the last record or a revision. If a known job still has requested records, this tool returns nextAction grounding_next_batch instead of ending the batch.",
           "This tool waits for the user's review without a timeout. Never confirm on the user's behalf or treat a rejected candidate as complete.",
           "Provide reason with the direct visible evidence that connects this box to the requested object and part. A color match alone is not sufficient. Material movement from the prior working box is shown to the reviewer.",
+          "Record grounding_evidence state.contract before submitting a supported result. The runtime checks exact originalQuery, declared requirements/identities and source-coordinate candidate order. Missing or unresolved checks are shown in human review as unresolved with confidence at most 0.49; best-supported tentative boxes remain reviewable. No additional image/color call is required just to submit uncertainty.",
           "Before submitting, reconcile the proposed target with the original query and user requirements, including any required identity, attribute, relation or order. Explain the evidence for those requirements; for ordinal targets include the supported count and spatial order. If a required condition or cross-modal correspondence remains unestablished, use status unresolved with low confidence and state what is missing. A measured box is not proof that the request is satisfied.",
           "If bbox coordinates were measured against the last grounding_view crop, set coordinateSpace to last_crop so the runtime maps them back to the full source image.",
           "Do not write grounding progress or submission files with write, edit, bash, or powershell.",
@@ -2489,6 +2706,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         promptGuidelines: [
           "Use grounding_save_and_next between records. It blocks for manual review; the user must approve before any later record is loaded. Rejection means revise the same record.",
           "Provide reason with direct visible evidence for target identity, owning object and requested part. If the candidate moved materially, explain the new evidence that caused the change.",
+          "Record grounding_evidence state.contract before submitting a supported result. The runtime checks exact originalQuery, declared requirements/identities and source-coordinate candidate order. Missing or unresolved checks are shown in human review as unresolved with confidence at most 0.49; best-supported tentative boxes remain reviewable. No additional image/color call is required just to submit uncertainty.",
           "Before submitting, reconcile the proposed target with the original query and user requirements, including any required identity, attribute, relation or order. Explain the evidence for those requirements; for ordinal targets include the supported count and spatial order. If a required condition or cross-modal correspondence remains unestablished, use status unresolved with low confidence and state what is missing. A measured box is not proof that the request is satisfied.",
           "If bbox coordinates were measured against the last grounding_view crop, set coordinateSpace to last_crop so the runtime maps them back to the full source image.",
           "Use grounding_save_result for the last requested record.",
@@ -2545,6 +2763,13 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         if (!active || !batchMode || savingRecord || reviewInterrupted || event.outcome !== "completed" || !event.context.canContinue) return undefined;
         const current = loadedBatchRecords.entries().next().value as [string, LoadedBatchRecord] | undefined;
         if (!current) {
+          if (jobRestoreWarning) return undefined;
+          if (persistedPending) {
+            if (continuationNudges >= 1) return undefined;
+            continuationNudges += 1;
+            return { entries: [{ type: "custom_message" as const, customType: "grounding-required-restore", display: false,
+              content: `Record ${persistedPending.key} is still pending human review after restoration. Call grounding_next_batch to reload its original query and image evidence; do not claim the job is complete.` }], continue: true };
+          }
           if (!batchToolStarted) {
             if (startupNudges >= 1) return undefined;
             startupNudges += 1;
@@ -2592,7 +2817,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         };
       });
 
-      pi.on("session_start", (_event, ctx) => {
+      pi.on("session_start", async (_event, ctx) => {
         const entries = ctx.sessionManager.getEntries();
         const previousPromptTexts = entries.map(groundingEntryText);
         const hasPersistedJob = entries.some((entry) => entry.type === "custom" && entry.customType === "grounding:job"
@@ -2620,6 +2845,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
                       ...(currentBbox ? { currentBbox } : {}),
                       ...(workingState ? { workingState } : {}),
                       ...(pending.revision === true ? { revision: true } : {}),
+                      ...(typeof pending.humanApprovalId === "string" ? { humanApprovalId: pending.humanApprovalId } : {}),
                     };
                   } catch {
                     // Ignore malformed optional pending data while retaining
@@ -2643,6 +2869,21 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         batchMode = Boolean(lastJob) || persistedGrounding && previousPromptTexts.some((text) => (
           /batch|queries?\.json|visible|infrared|depth|图像|图片|定位/i.test(text)
         ));
+        if (lastJob) {
+          // Restoration is read-only with respect to progress and predictions.
+          // Pending evidence does not count as approval, including after a crash.
+          batchToolStarted = true;
+          try {
+            const { sourcePath, state } = await loadQueryState(lastJob.queryPath);
+            const outputDir = resolvedOutputDirectory(options.cwd, sourcePath, lastJob.outputDir);
+            lastJob = { queryPath: sourcePath, outputDir };
+            const progress = await readGroundingProgress(join(outputDir, "progress.jsonl"));
+            reconcileJobProgress(state, progress);
+            jobRestoreWarning = await reconcileGroundingArtifacts(state, progress, outputDir);
+          } catch (error) {
+            jobRestoreWarning = `Could not reconcile saved progress: ${(error as Error).message}. Use grounding_status to retry before claiming completion.`;
+          }
+        }
         setGroundingToolsActive(active);
       });
 
@@ -2658,7 +2899,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           /批处理/i.test(event.prompt)
           || (/queries?\.json/i.test(event.prompt) && /(?:visible|infrared|depth|处理|定位|全部|所有|全量)/i.test(event.prompt))
         ) batchMode = true;
-        if (requestedCount !== undefined && (loadedBatchRecords.size === 0 || adjustsRemainingCount)) {
+        if (requestedCount !== undefined && (!hasPendingRecord || adjustsRemainingCount)) {
           batchMode = true;
           requestedRecordLimit = requestedCount;
           requestedCountPending = !hasPendingRecord;
@@ -2680,8 +2921,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Runtime grounding safety is active.",
           lastJob ? `Current dataset: ${lastJob.queryPath}. Current output directory: ${lastJob.outputDir}.` : "",
           `Job state: ${JSON.stringify(jobSnapshot())}.`,
+          "Use grounding_evidence state.contract for explicit original-query constraints, alternative readings, candidate identity support and source-coordinate ordering before any lock or supported submission. Missing/contradicted evidence cannot create a locked selection or default ok review. The runtime computes geometry only over your declared comparable set; it cannot recognize objects or prove interpretation/candidate completeness. You may submit a best-supported unresolved box for human review without additional color/crop calls. Repeated renders of the same pixels do not increase identity confidence.",
           "Keep the original query and the user's task requirements as the target throughout observation, candidate changes and review. A newly noticed object, working hypothesis or convenient tool result must not silently replace the requested object or drop a required attribute, relation or order. Before submitting a box, reconcile the proposal with every requirement actually present in the request and explain the supporting evidence. If a requirement is unestablished or contradicted, state what is unresolved and use low confidence with status unresolved instead of reinterpreting the query to fit the candidate. Pixel measurements alone do not establish that the request is satisfied.",
-          "For continue/status questions, call grounding_status instead of listing directories. If remaining is zero, explain the dataset is complete; do not claim to begin the first record again. For a user-requested correction, find the key in grounding_status and call grounding_reopen_record, then submit the revised box for human review. Do not treat your run's saved predictions as reference annotations.",
+          "For continue/status questions, call grounding_status instead of listing directories. If remaining is zero and job.restorationWarning is absent, explain the dataset is complete; do not claim to begin the first record again. If restorationWarning reports incomplete output artifacts, call grounding_next_batch to repair them from approved progress before claiming output completion. For a user-requested correction, find the key in grounding_status and call grounding_reopen_record, then submit the revised box for human review. Do not treat your run's saved predictions as reference annotations.",
           "grounding_color_region is an optional local pixel-measurement aid, not a required step for every record or every colored target. First establish object/part identity from the image and context. Use it only when reliable local color contrast helps resolve a remaining boundary question; skip it if the box is clear or color is unhelpful. For unresolved identity, inspect existing evidence or use grounding_view/grounding_compare as needed. Uncertainty is preferable to a forced color match. No extra model or shell/file enumeration is needed.",
           "Color analysis samples only the original visible image; infrared/depth palettes and viewId coordinate mapping do not supply color or alignment evidence. Lighting, shadows, reflections, similar colors, low resolution and occlusion can make a mask misleading. Inspect selectionAssessment, pointSample and clean/mask previews when using it. Measured bounds cover matching pixels only, not necessarily the complete target, and cannot recover hidden boundaries.",
           "Human review is mandatory for every record, including unresolved and low-confidence results. Save tools display the current box and wait for the user to approve it. Never approve on the user's behalf. Only an approved record may be saved or followed by another record; rejection means revise that same record and request review again. Waiting for the user is a valid pause, not an error or a reason to retry.",

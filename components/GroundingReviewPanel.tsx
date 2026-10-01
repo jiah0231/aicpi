@@ -39,6 +39,8 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
   const [candidateRank, setCandidateRank] = useState<number | undefined>(details.candidateRank);
   const [confidence, setConfidence] = useState(details.confidence);
   const [reason, setReason] = useState(details.reason);
+  const [constraintsResolved, setConstraintsResolved] = useState(false);
+  const unresolvedChecks = details.constraintAssessment !== undefined && !details.constraintAssessment.canLock;
   const [rejectionReason, setRejectionReason] = useState("");
   const [submission, setSubmission] = useState<"confirm" | "reject" | "submitted" | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -60,7 +62,8 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
     if (!Number.isInteger(candidateCount) || candidateCount < 0) messages.push("Candidate count must be a non-negative integer.");
     if (targetFound && candidateCount < 1) messages.push("A found target needs at least one candidate.");
     if (!targetFound && status !== "unresolved") messages.push("A missing target must be saved as unresolved.");
-    if (targetFound && (!Number.isInteger(candidateRank) || (candidateRank ?? 0) < 1 || (candidateRank ?? 0) > candidateCount)) {
+    if (targetFound && (candidateRank !== undefined || details.expectedOrdinal !== undefined)
+      && (!Number.isInteger(candidateRank) || (candidateRank ?? 0) < 1 || (candidateRank ?? 0) > candidateCount)) {
       messages.push("Candidate rank must be within the candidate count.");
     }
     if (details.expectedOrdinal !== undefined && targetFound && candidateRank !== details.expectedOrdinal) {
@@ -68,8 +71,11 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
     }
     if (reason.trim().length < 8) messages.push("Add a short evidence reason (at least 8 characters).");
     if (status === "ok" && confidence < 0.5) messages.push("An ok result needs confidence of at least 0.5; use low_confidence instead.");
+    if (unresolvedChecks && (status !== "unresolved" || confidence > 0.49) && !constraintsResolved) {
+      messages.push("Keep unresolved checks at status unresolved and confidence ≤ 0.49, or explicitly confirm you resolved them below.");
+    }
     return messages;
-  }, [bbox, candidateCount, candidateRank, confidence, details.expectedOrdinal, reason, status, targetFound]);
+  }, [bbox, candidateCount, candidateRank, confidence, details.expectedOrdinal, reason, status, targetFound, unresolvedChecks, constraintsResolved]);
 
   const send = async (action: "confirm" | "reject", payload: Record<string, unknown>) => {
     if (submissionLocked.current) return;
@@ -96,6 +102,7 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
       targetFound,
       candidateCount,
       ...(candidateRank === undefined ? {} : { candidateRank }),
+      ...(constraintsResolved ? { constraintsResolved: true } : {}),
       reason: reason.trim(),
     });
   };
@@ -212,6 +219,34 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
           </div>
 
           <fieldset disabled={busy} style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 10, margin: 0, padding: 0, border: 0 }}>
+            {details.constraintAssessment && (
+              <div role={unresolvedChecks ? "alert" : "status"} style={{ display: "grid", gap: 6, padding: "9px 10px", border: "1px solid var(--border)", borderRadius: 6, background: unresolvedChecks ? "rgba(245,158,11,0.10)" : "var(--bg-panel)", fontSize: 12, lineHeight: 1.5, overflowWrap: "anywhere" }}>
+                <strong>{unresolvedChecks ? "原始问题 / 目标证据仍有未解决项" : "模型声明的约束已通过一致性检查，仍需人工审核"}</strong>
+                {details.modelProposal && <div>模型原提议：{details.modelProposal.status} / {details.modelProposal.confidence.toFixed(2)}。审核默认值已按未解决证据降低。</div>}
+                {details.constraintAssessment.issues.map((issue, index) => <div key={`${issue.code}-${index}`}>• {issue.message}</div>)}
+                {details.constraintAssessment.orders.map((order) => (
+                  <div key={order.interpretationId}>
+                    {order.interpretationId}: {order.axis} / {order.direction}，请求第 {order.ordinal} 个；坐标排序 {order.orderedCandidateIds.join(" → ") || "无"}。
+                    支持 / 可能候选 {order.supportedCount} / {order.possibleCount}；所选 {order.selectedCandidateId} 排名 {order.selectedRank ?? "未确定"}
+                  </div>
+                ))}
+                {details.modelContract && <details>
+                  <summary>模型声明的候选、原文约束与不同解读</summary>
+                  {details.modelContract.candidates.map((candidate) => <div key={candidate.id}>
+                    {candidate.id}: {candidate.identity.label} · {candidate.identity.status} · {candidate.identity.basis} · [{candidate.bbox.map(formatCoordinate).join(", ")}] · {candidate.identity.evidence}
+                  </div>)}
+                  {details.modelContract.interpretations.map((reading) => <div key={reading.id} style={{ marginTop: 6 }}>
+                    <strong>{reading.reading} · {reading.status}</strong><div>{reading.evidence}</div>
+                    {reading.requirements.map((requirement) => <div key={requirement.id}>“{requirement.queryText}” · {requirement.status}: {requirement.evidence}</div>)}
+                  </div>)}
+                </details>}
+                <div style={{ color: "var(--text-muted)" }}>这里只检查模型声明与坐标的一致性，不能识别物体或证明候选完整。放大、重复裁剪和颜色测量不会补充缺失的身份依据。可以保留 unresolved 后人工确认保存。</div>
+                {unresolvedChecks && <label style={{ display: "flex", gap: 7, alignItems: "flex-start" }}>
+                  <input type="checkbox" checked={constraintsResolved} onChange={(event) => setConstraintsResolved(event.target.checked)} />
+                  我已对照原始问题和图像，亲自解决上述未确定项；如提高状态或置信度，请在理由中说明
+                </label>}
+              </div>
+            )}
             <fieldset style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 7, margin: 0, padding: 0, border: 0 }}>
               {(["x1", "y1", "x2", "y2"] as const).map((label, index) => (
                 <label key={label} style={{ display: "grid", gap: 4, color: "var(--text-muted)", fontSize: 11 }}>
@@ -224,6 +259,7 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
                     step={0.001}
                     value={Number.isFinite(bbox[index]) ? bbox[index] : ""}
                     onChange={(event) => {
+                      setConstraintsResolved(false);
                       const next = Number(event.target.value);
                       setBbox((current) => current.map((value, currentIndex) => currentIndex === index ? next : value) as Bbox);
                     }}

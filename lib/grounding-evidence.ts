@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { validateGroundingConstraintContract, type GroundingConstraintContract } from "./grounding-constraints";
 
 export type GroundingWorkingState = {
   target?: string;
@@ -6,6 +7,7 @@ export type GroundingWorkingState = {
   hypotheses?: string[];
   openQuestions?: string[];
   ruledOut?: string[];
+  contract?: GroundingConstraintContract;
   selection?: {
     status: "locked" | "reconsidering";
     bbox?: [number, number, number, number];
@@ -27,17 +29,20 @@ export type GroundingEvidenceOptions = {
 };
 
 /** Validate a concise evidence notebook, not a request for private reasoning. */
-export function validateGroundingWorkingState(input: unknown): GroundingWorkingState {
+export function validateGroundingWorkingState(input: unknown, originalQuery?: string): GroundingWorkingState {
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
     throw new Error("Grounding working state must be an object.");
   }
   const fields = input as Record<string, unknown>;
-  const allowed = new Set(["target", "facts", "hypotheses", "openQuestions", "ruledOut", "selection"]);
+  const allowed = new Set(["target", "facts", "hypotheses", "openQuestions", "ruledOut", "selection", "contract"]);
   for (const key of Object.keys(fields)) {
     if (!allowed.has(key)) throw new Error(`Unknown grounding working state field: ${key}`);
   }
 
   const result: GroundingWorkingState = {};
+  if (Object.hasOwn(fields, "contract")) {
+    result.contract = validateGroundingConstraintContract(fields.contract, originalQuery);
+  }
   if (Object.hasOwn(fields, "target")) {
     result.target = validateText(fields.target, "target", GROUNDING_WORKING_STATE_LIMITS.targetCharacters);
   }

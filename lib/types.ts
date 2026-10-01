@@ -1,3 +1,5 @@
+import type { GroundingConstraintAssessment, GroundingConstraintContract } from "./grounding-constraints";
+
 // Types mirrored from pi-mono coding-agent session-manager
 
 export interface SessionHeader {
@@ -157,6 +159,9 @@ export interface GroundingReviewDetails {
   rawBbox?: [number, number, number, number];
   previousBbox?: [number, number, number, number];
   candidateChange?: GroundingCandidateChange;
+  constraintAssessment?: GroundingConstraintAssessment;
+  modelContract?: GroundingConstraintContract;
+  modelProposal?: { status: GroundingReviewStatus; confidence: number };
   status: GroundingReviewStatus;
   confidence: number;
   targetFound: boolean;
@@ -179,6 +184,7 @@ export type GroundingReviewResponse =
       targetFound: boolean;
       candidateCount: number;
       candidateRank?: number;
+      constraintsResolved?: boolean;
       reason: string;
     }
   | {
