@@ -665,23 +665,83 @@ function recordImagePath(sourcePath: string, record: Record<string, string>, mod
   return resolve(dirname(sourcePath), path);
 }
 
-function readArchiveEntry(archivePath: string, entryPath: string): Promise<Buffer> {
+type ArchiveCommandOptions = {
+  encoding: "buffer";
+  maxBuffer: number;
+  timeout: number;
+  killSignal: "SIGKILL";
+  windowsHide: true;
+};
+
+type ArchiveCommandRunner = (
+  command: string,
+  args: string[],
+  options: ArchiveCommandOptions,
+) => Promise<Buffer>;
+
+const runArchiveCommand: ArchiveCommandRunner = (command, args, options) => {
   return new Promise((resolveEntry, rejectEntry) => {
     execFile(
-      "tar",
-      ["-xOf", archivePath, entryPath],
-      { encoding: "buffer", maxBuffer: 64 * 1024 * 1024, windowsHide: true },
+      command,
+      args,
+      options,
       (error, stdout, stderr) => {
         if (error) {
-          rejectEntry(new Error(
-            `Could not read ${entryPath} from ${archivePath}: ${stderr.toString().trim() || error.message}`,
-          ));
+          rejectEntry(new Error(stderr.toString().trim() || error.message, { cause: error }));
           return;
         }
         resolveEntry(stdout);
       },
     );
   });
+};
+
+export async function readArchiveEntry(
+  archivePath: string,
+  entryPath: string,
+  runCommand: ArchiveCommandRunner = runArchiveCommand,
+): Promise<Buffer> {
+  // Windows/macOS ship a ZIP-capable tar, but GNU tar on Linux does not.
+  // Keep extraction streaming: loading a whole dataset ZIP with JSZip can
+  // exhaust memory even when the single requested image is small.
+  const options: ArchiveCommandOptions = {
+    encoding: "buffer", maxBuffer: 64 * 1024 * 1024,
+    timeout: 30_000, killSignal: "SIGKILL", windowsHide: true,
+  };
+  const resolvedArchive = resolve(archivePath);
+  const literalEntry = entryPath.replace(/[\\*?[\]]/g, "\\$&");
+  const message = (value: unknown) => value instanceof Error ? value.message : String(value);
+  let tarError: unknown;
+  try {
+    let tarEntry = entryPath;
+    const selectionOptions: string[] = [];
+    if (literalEntry !== entryPath) {
+      // BSD tar always treats member names as patterns; GNU tar treats them
+      // literally by default. Do not guess when a name contains glob syntax.
+      const version = (await runCommand("tar", ["--version"], {
+        ...options, maxBuffer: 64 * 1024, timeout: 5_000,
+      })).toString();
+      if (/bsdtar|libarchive/i.test(version)) tarEntry = literalEntry;
+      else if (/GNU tar/i.test(version)) selectionOptions.push("--no-wildcards");
+      else throw new Error("Cannot establish literal member matching for this tar implementation");
+    }
+    return await runCommand("tar", ["-xOf", resolvedArchive, ...selectionOptions, "--", tarEntry], options);
+  } catch (error) {
+    tarError = error;
+  }
+  if (extname(resolvedArchive).toLowerCase() !== ".zip") {
+    throw new Error(`Could not read ${entryPath} from ${archivePath}: tar: ${message(tarError)}`, { cause: tarError });
+  }
+  try {
+    // GNU-tar systems need unzip for ZIP datasets. Its member arguments are
+    // patterns even without a shell; escaping prevents concatenating siblings.
+    return await runCommand("unzip", ["-p", resolvedArchive, literalEntry], options);
+  } catch (error) {
+    throw new Error(
+      `Could not read ${entryPath} from ${archivePath}: tar: ${message(tarError)}; unzip: ${message(error)}`,
+      { cause: error },
+    );
+  }
 }
 
 /**
@@ -1232,7 +1292,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
   };
   const readRecordImage: GroundingImageReader = async (sourcePath, record, modality) => {
     const directPath = recordImagePath(sourcePath, record, modality);
-    const directKey = `file:${normalizePath(directPath)}`;
+    // File identity is case-sensitive on Linux. The safety guard's folded
+    // paths must not make A.png reuse a.png's image bytes.
+    const directKey = `file:${directPath}`;
     try {
       return await cachedImageSource(directKey, async () => ({
         bytes: await readFile(directPath),
@@ -1244,7 +1306,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
 
     const archivePath = archivePathFor(sourcePath, modality);
     const entryPath = `${modality}/${basename(record[modality])}`;
-    const archiveKey = `zip:${normalizePath(archivePath)}::${entryPath.toLowerCase()}`;
+    // ZIP member names remain case-sensitive even on Windows.
+    const archiveKey = JSON.stringify(["zip", resolve(archivePath), entryPath]);
     return cachedImageSource(archiveKey, async () => {
       try {
         return {

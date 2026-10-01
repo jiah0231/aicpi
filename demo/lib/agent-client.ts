@@ -70,23 +70,48 @@ async function sendOnce<T>(sessionId: string, command: Record<string, unknown>):
     throw new AgentCommandError(`Agent transport failed: ${message}`, 0, "transport_error");
   }
 
-  const raw = await res.text().catch(() => "");
+  let raw = "";
+  try {
+    raw = await res.text();
+  } catch (error) {
+    // Fetch can resolve after the headers arrive and still lose the body. A
+    // successful status alone does not acknowledge the command. Preserve a
+    // known HTTP rejection, but treat an interrupted success body like any
+    // other transport failure so only safe commands can be retried.
+    if (res.ok) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new AgentCommandError(`Agent transport failed: ${message}`, 0, "transport_error");
+    }
+  }
   let body: AgentCommandResponse<T> = {};
   if (raw) {
     try {
-      body = JSON.parse(raw) as AgentCommandResponse<T>;
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        body = parsed as AgentCommandResponse<T>;
+      }
     } catch {
       // Keep the raw response as the diagnostic below.
     }
   }
 
-  if (!res.ok || body.error) {
-    const message = body.error ?? (raw.trim() || `HTTP ${res.status}`);
+  const apiError = typeof body.error === "string" ? body.error : undefined;
+  if (!res.ok || apiError) {
+    const message = apiError ?? (raw.trim() || `HTTP ${res.status}`);
     throw new AgentCommandError(
       message,
       res.status,
-      body.code ?? "http_error",
-      body.accepted,
+      typeof body.code === "string" ? body.code : "http_error",
+      typeof body.accepted === "boolean" ? body.accepted : undefined,
+    );
+  }
+  // Proxy HTML, empty/truncated JSON and unrelated JSON are not successful
+  // replies. Keep acceptance unknown and do not retry malformed envelopes.
+  if (body.success !== true) {
+    throw new AgentCommandError(
+      "Agent returned an invalid command response; command acceptance is unknown.",
+      res.status,
+      "invalid_response",
     );
   }
   return body.data as T;
