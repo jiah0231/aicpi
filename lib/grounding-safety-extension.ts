@@ -42,6 +42,12 @@ const GROUNDING_TOOL_NAMES = [
 const IMAGE_TARGET_LONG_SIDE = 768;
 const IMAGE_MAX_LONG_SIDE = 1600;
 const IMAGE_MAX_ZOOM = 12;
+// Some OpenAI-compatible gateways reject the HTTP body before the model sees
+// it. Keep every model-facing preview below one bounded base64 size even when
+// the SDK image resizer is unavailable. Original bytes are still used for
+// crops, color analysis and saved source coordinates.
+const GROUNDING_PREVIEW_MAX_BASE64_CHARS = 1_250_000;
+const GROUNDING_PREVIEW_JPEG_QUALITIES = [82, 70, 58, 46, 38, 30] as const;
 const CROP_GRID_STEPS = [0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2] as const;
 const CROP_GRID_MAX_LINES = 8;
 const CROP_GRID_COLOR = "#22d3ee";
@@ -165,6 +171,95 @@ type GroundingImageReader = (
   record: Record<string, string>,
   modality: GroundingModality,
 ) => Promise<GroundingImageSource>;
+
+type EncodedGroundingPreview = {
+  data: string;
+  mimeType: string;
+  width: number;
+  height: number;
+};
+
+async function encodeGroundingPreview(
+  bytes: Buffer,
+  mimeType: string,
+  targetSize?: { width: number; height: number },
+): Promise<EncodedGroundingPreview> {
+  let workingBytes = bytes;
+  let metadata = await sharp(workingBytes, { failOn: "error" }).metadata();
+  if (!metadata.width || !metadata.height) throw new Error("Could not determine grounding preview dimensions.");
+  if (targetSize && (metadata.width !== targetSize.width || metadata.height !== targetSize.height)) {
+    workingBytes = await sharp(workingBytes, { failOn: "error" })
+      .resize({ width: targetSize.width, height: targetSize.height, fit: "fill", kernel: "lanczos3" })
+      .png()
+      .toBuffer();
+    metadata = { ...metadata, width: targetSize.width, height: targetSize.height };
+  }
+  let width = metadata.width;
+  let height = metadata.height;
+  const originalData = workingBytes.toString("base64");
+  if (originalData.length <= GROUNDING_PREVIEW_MAX_BASE64_CHARS) {
+    return { data: originalData, mimeType, width, height };
+  }
+
+  // Preserve the display grid first and lower JPEG quality. If a deliberately
+  // adversarial/high-entropy frame still exceeds the gateway-safe limit, shrink
+  // the display and let callers update their coordinate mapping to these exact
+  // returned dimensions.
+  while (true) {
+    let smallest: Buffer | undefined;
+    for (const quality of GROUNDING_PREVIEW_JPEG_QUALITIES) {
+      const encoded = await sharp(workingBytes, { failOn: "error" })
+        .flatten({ background: "#ffffff" })
+        .jpeg({ quality, chromaSubsampling: "4:4:4", progressive: true })
+        .toBuffer();
+      smallest = encoded;
+      const data = encoded.toString("base64");
+      if (data.length <= GROUNDING_PREVIEW_MAX_BASE64_CHARS) {
+        return { data, mimeType: "image/jpeg", width, height };
+      }
+    }
+    const currentLength = smallest!.toString("base64").length;
+    const scale = Math.min(0.85, Math.max(0.5, Math.sqrt(GROUNDING_PREVIEW_MAX_BASE64_CHARS / currentLength) * 0.92));
+    const nextWidth = Math.max(1, Math.floor(width * scale));
+    const nextHeight = Math.max(1, Math.floor(height * scale));
+    if (nextWidth === width && nextHeight === height) {
+      throw new Error("Could not reduce grounding preview below the transport payload limit.");
+    }
+    width = nextWidth;
+    height = nextHeight;
+    workingBytes = await sharp(workingBytes, { failOn: "error" })
+      .resize({ width, height, fit: "fill", kernel: "lanczos3" })
+      .png()
+      .toBuffer();
+  }
+}
+
+async function encodeGroundingImagePayload(image: GroundingImage): Promise<GroundingImage> {
+  const imageBlock = image.content.find((block) => block.type === "image");
+  if (!imageBlock || imageBlock.type !== "image") throw new Error("Grounding image payload is missing.");
+  const encoded = await encodeGroundingPreview(Buffer.from(imageBlock.data, "base64"), imageBlock.mimeType);
+  const originalWidth = image.details.originalWidth ?? encoded.width;
+  const originalHeight = image.details.originalHeight ?? encoded.height;
+  const content = image.content.map((block) => {
+    if (block.type === "image") return { ...block, data: encoded.data, mimeType: encoded.mimeType };
+    try {
+      const value = JSON.parse(block.text) as Record<string, unknown>;
+      value.dimensions = `${originalWidth}x${originalHeight} source pixels; displayed as ${encoded.width}x${encoded.height}`;
+      value.displayedSizePixels = [encoded.width, encoded.height];
+      value.payloadEncoding = { mimeType: encoded.mimeType, base64Characters: encoded.data.length,
+        resizedForTransport: encoded.width !== image.details.width || encoded.height !== image.details.height };
+      if (Array.isArray(value.cropSizePixels)) {
+        const cropSize = value.cropSizePixels as number[];
+        value.magnification = Math.min(encoded.width / cropSize[0], encoded.height / cropSize[1]);
+        value.effectiveMagnification = { x: encoded.width / cropSize[0], y: encoded.height / cropSize[1] };
+      }
+      return { ...block, text: JSON.stringify(value) };
+    } catch {
+      return block;
+    }
+  });
+  return { ...image, content, details: { ...image.details, width: encoded.width, height: encoded.height } };
+}
 
 type GroundingViewDetails = ReturnType<typeof groundingTargetReminder> & {
   key: string;
@@ -863,7 +958,7 @@ async function loadGroundingImage(
     ],
     details,
   };
-  if (!includeOverlay) return image;
+  if (!includeOverlay) return encodeGroundingImagePayload(image);
   return withGroundingOverlay(
     image,
     normalizedCurrentBbox,
@@ -1069,7 +1164,7 @@ async function loadGroundingCrop(
       cropNormalized: displayedNormalized,
     },
   };
-  if (!showHypothesis || !currentBboxInCrop) return image;
+  if (!showHypothesis || !currentBboxInCrop) return encodeGroundingImagePayload(image);
   return withGroundingOverlay(
     image,
     currentBboxInCrop,
@@ -1190,12 +1285,12 @@ async function withGroundingOverlay(
     .composite([{ input: Buffer.from(overlaySvg), top: 0, left: 0 }])
     .png()
     .toBuffer();
-  return {
+  return encodeGroundingImagePayload({
     ...image,
     content: image.content.map((block) => block.type === "image"
       ? { ...block, data: output.toString("base64"), mimeType: "image/png" }
       : block),
-  };
+  });
 }
 
 /**
@@ -1249,7 +1344,8 @@ async function renderGroundingOverlay(
     .composite([{ input: Buffer.from(overlaySvg), top: 0, left: 0 }])
     .png()
     .toBuffer();
-  return { data: output.toString("base64"), mimeType: "image/png", width, height };
+  const encoded = await encodeGroundingPreview(output, "image/png");
+  return { data: encoded.data, mimeType: encoded.mimeType, width: encoded.width, height: encoded.height };
 }
 function block(reason: string) {
   return { block: true, reason: `[grounding safety] ${reason}` };
@@ -1996,16 +2092,23 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const { bytes } = await readRecordImage(loaded.sourcePath, loaded.record, "visible");
           const { rawPreview, maskPreview, ...analysis } = await analyzeGroundingColor(bytes, { ...params, region, point });
           signal?.throwIfAborted();
-          const details = { key, ...groundingTargetReminder(loaded), ...analysis, coordinateSpace: "source", inputCoordinateSpace: coordinateSpace,
+          const encodedRawPreview = await encodeGroundingPreview(rawPreview, "image/png");
+          const encodedMaskPreview = await encodeGroundingPreview(maskPreview, "image/png", {
+            width: encodedRawPreview.width,
+            height: encodedRawPreview.height,
+          });
+          const details = { key, ...groundingTargetReminder(loaded), ...analysis,
+            previewWidth: encodedRawPreview.width, previewHeight: encodedRawPreview.height,
+            coordinateSpace: "source", inputCoordinateSpace: coordinateSpace,
             ...(params.viewId ? { inputViewId: params.viewId } : {}), saved: false,
             note: "Local visible-image color measurement only. selectionAssessment.establishesObjectIdentity is always false. Bounds enclose selected matching pixels, not necessarily the whole target or part; verify identity and boundaries against visible structure, and discard misleading measurements." };
           const view = loaded.views.register({ modality: "visible", region: analysis.region, sourceWidth: analysis.sourceWidth,
-            sourceHeight: analysis.sourceHeight, width: analysis.previewWidth, height: analysis.previewHeight, decorations: "none", label: "Color ROI (raw and mask share coordinates)" });
+            sourceHeight: analysis.sourceHeight, width: encodedRawPreview.width, height: encodedRawPreview.height, decorations: "none", label: "Color ROI (raw and mask share coordinates)" });
           const evidenceDetails = { ...details, viewId: view.id, coordinateMapping: view, evidenceViewIds: [view.id] };
           return { content: [
             { type: "text" as const, text: JSON.stringify(evidenceDetails) },
-            { type: "image" as const, data: rawPreview.toString("base64"), mimeType: "image/png" },
-            { type: "image" as const, data: maskPreview.toString("base64"), mimeType: "image/png" },
+            { type: "image" as const, data: encodedRawPreview.data, mimeType: encodedRawPreview.mimeType },
+            { type: "image" as const, data: encodedMaskPreview.data, mimeType: encodedMaskPreview.mimeType },
           ], details: evidenceDetails };
         },
       });
@@ -2087,6 +2190,12 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             return Buffer.from(block.data, "base64");
           };
           const comparison = await buildGroundingComparison(bytes(overview), crops.map((crop, index) => ({ label: regions[index].label, image: bytes(crop) })));
+          const encodedComparison = await encodeGroundingPreview(comparison.image, "image/png");
+          const scaleX = encodedComparison.width / comparison.width;
+          const scaleY = encodedComparison.height / comparison.height;
+          const scaleRect = (rect: readonly number[]): [number, number, number, number] => [
+            rect[0] * scaleX, rect[1] * scaleY, rect[2] * scaleX, rect[3] * scaleY,
+          ];
           const sourceWidth = overview.details.originalWidth!, sourceHeight = overview.details.originalHeight!;
           const registerComparisonView = (input: Omit<GroundingViewDescriptor, "id">) => {
             const sourceReuse = loaded.views.sourceReuse(input);
@@ -2094,10 +2203,10 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             return { ...view, ...(sourceReuse ? { sourceReuse } : {}) };
           };
           const overviewView = registerComparisonView({ modality, region: [0, 0, 1, 1], sourceWidth, sourceHeight,
-            width: comparison.width, height: comparison.height, displayRect: comparison.overviewRect, decorations: "none", label: "Overview" });
+            width: encodedComparison.width, height: encodedComparison.height, displayRect: scaleRect(comparison.overviewRect), decorations: "none", label: "Overview" });
           const panels = comparison.panels.map((panel, index) => registerComparisonView({ modality,
-            region: crops[index].details.cropNormalized!, sourceWidth, sourceHeight, width: comparison.width, height: comparison.height,
-            displayRect: panel.rect, decorations: "none", label: panel.label }));
+            region: crops[index].details.cropNormalized!, sourceWidth, sourceHeight, width: encodedComparison.width, height: encodedComparison.height,
+            displayRect: scaleRect(panel.rect), decorations: "none", label: panel.label }));
           grantRecordModality(loaded, modality);
           const repeatedPanels = panels.filter((panel) => panel.sourceReuse);
           const details = { key, ...groundingTargetReminder(loaded), modality, reason: params.reason, overview: overviewView, panels,
@@ -2105,7 +2214,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             ...(repeatedPanels.length ? { decisionCheckpoint: `${repeatedPanels.length} comparison panel(s) substantially reuse prior source pixels. Record what changed before repeating the same identity comparison.` } : {}),
             note: "Use one panel's viewId. view_pixels and view_normalized refer to this WHOLE comparison canvas; the box must lie inside that panel's displayRect. Source coordinates use coordinateSpace source. Panels may have different display scales." };
           return { content: [{ type: "text" as const, text: JSON.stringify(details) },
-            { type: "image" as const, data: comparison.image.toString("base64"), mimeType: "image/png" }], details };
+            { type: "image" as const, data: encodedComparison.data, mimeType: encodedComparison.mimeType }], details };
         },
       });
 
