@@ -6,6 +6,11 @@ export type GroundingWorkingState = {
   hypotheses?: string[];
   openQuestions?: string[];
   ruledOut?: string[];
+  selection?: {
+    status: "locked" | "reconsidering";
+    bbox?: [number, number, number, number];
+    evidence: string;
+  };
 };
 
 export const GROUNDING_WORKING_STATE_LIMITS = {
@@ -26,7 +31,7 @@ export function validateGroundingWorkingState(input: unknown): GroundingWorkingS
     throw new Error("Grounding working state must be an object.");
   }
   const fields = input as Record<string, unknown>;
-  const allowed = new Set(["target", "facts", "hypotheses", "openQuestions", "ruledOut"]);
+  const allowed = new Set(["target", "facts", "hypotheses", "openQuestions", "ruledOut", "selection"]);
   for (const key of Object.keys(fields)) {
     if (!allowed.has(key)) throw new Error(`Unknown grounding working state field: ${key}`);
   }
@@ -46,6 +51,39 @@ export function validateGroundingWorkingState(input: unknown): GroundingWorkingS
       `${key}[${index}]`,
       GROUNDING_WORKING_STATE_LIMITS.itemCharacters,
     ));
+  }
+  if (Object.hasOwn(fields, "selection")) {
+    const selection = fields.selection;
+    if (selection === null || typeof selection !== "object" || Array.isArray(selection)) {
+      throw new Error("Grounding working state selection must be an object.");
+    }
+    const values = selection as Record<string, unknown>;
+    for (const key of Object.keys(values)) {
+      if (!["status", "bbox", "evidence"].includes(key)) {
+        throw new Error(`Unknown grounding working state selection field: ${key}`);
+      }
+    }
+    if (values.status !== "locked" && values.status !== "selected" && values.status !== "reconsidering") {
+      throw new Error("Grounding working state selection status must be locked or reconsidering.");
+    }
+    const status = values.status === "selected" ? "locked" : values.status;
+    const evidence = validateText(values.evidence, "selection.evidence", GROUNDING_WORKING_STATE_LIMITS.itemCharacters);
+    if (evidence.length < 8) throw new Error("Grounding working state selection evidence must contain at least 8 characters.");
+    let bbox: [number, number, number, number] | undefined;
+    if (Object.hasOwn(values, "bbox")) {
+      if (!Array.isArray(values.bbox) || values.bbox.length !== 4
+        || values.bbox.some((edge) => typeof edge !== "number" || !Number.isFinite(edge))) {
+        throw new Error("Grounding working state selection bbox must contain four finite numbers.");
+      }
+      bbox = [...values.bbox] as [number, number, number, number];
+      if (bbox.some((edge) => edge < 0 || edge > 1) || bbox[0] >= bbox[2] || bbox[1] >= bbox[3]) {
+        throw new Error("Grounding working state selection bbox must be a valid normalized box.");
+      }
+    }
+    if (status === "locked" && !bbox) {
+      throw new Error("Grounding working state locked selection requires bbox.");
+    }
+    result.selection = { status, ...(bbox ? { bbox } : {}), evidence };
   }
   return result;
 }

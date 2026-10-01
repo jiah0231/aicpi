@@ -134,6 +134,8 @@ type LoadedBatchRecord = {
   views: GroundingViewRegistry;
   pinnedViewIds: Set<string>;
   archivedViewIds: Set<string>;
+  evidenceRevision: number;
+  lastRedundantViewRevision?: number;
   workingState?: GroundingWorkingState;
 };
 
@@ -281,14 +283,36 @@ function groundingTargetReminder(loaded: LoadedBatchRecord) {
 }
 
 function recordEvidence() {
-  return { views: new GroundingViewRegistry(), pinnedViewIds: new Set<string>(), archivedViewIds: new Set<string>() };
+  return {
+    views: new GroundingViewRegistry(),
+    pinnedViewIds: new Set<string>(),
+    archivedViewIds: new Set<string>(),
+    evidenceRevision: 0,
+  };
 }
 
-function registerGroundingView(loaded: LoadedBatchRecord, image: GroundingImage, decorations: GroundingViewDescriptor["decorations"]) {
+function registerGroundingView(
+  loaded: LoadedBatchRecord,
+  image: GroundingImage,
+  decorations: GroundingViewDescriptor["decorations"],
+  enforceReuseCheckpoint = false,
+) {
   const { originalWidth: sourceWidth, originalHeight: sourceHeight, width, height, modality } = image.details;
   if (!sourceWidth || !sourceHeight || !width || !height) throw new Error("The view is missing source/display dimensions.");
   const input = { modality, region: image.details.cropNormalized ?? [0, 0, 1, 1] as [number, number, number, number], sourceWidth, sourceHeight, width, height, decorations };
   const sourceReuse = loaded.views.sourceReuse(input);
+  const priorReuseView = sourceReuse ? loaded.views.get(sourceReuse.previousViewId) : undefined;
+  const priorIsOverview = priorReuseView?.region.every((edge, index) => edge === [0, 0, 1, 1][index]) === true;
+  const inputIsOverview = input.region.every((edge, index) => edge === [0, 0, 1, 1][index]);
+  if (enforceReuseCheckpoint && sourceReuse && (!priorIsOverview || inputIsOverview)) {
+    if (loaded.lastRedundantViewRevision === loaded.evidenceRevision) {
+      throw new Error(
+        "This region substantially reuses source pixels already inspected since the last evidence checkpoint. "
+        + "Use the existing view, save the selected target, or update grounding_evidence with the concrete unresolved question and new visible contradiction before another rerender.",
+      );
+    }
+    loaded.lastRedundantViewRevision = loaded.evidenceRevision;
+  }
   const equivalent = loaded.views.findEquivalent(input);
   const view = loaded.views.register(input);
   // Keep dimensions alongside the image, not just in UI-only tool details.
@@ -303,6 +327,14 @@ function registerGroundingView(loaded: LoadedBatchRecord, image: GroundingImage,
     } : equivalent ? { repeatedSourceViewId: equivalent.id,
       informationNote: "These source pixels were already viewed. A new display scale is not new source detail; compare identity/context or archive superseded evidence when useful." } : {}) });
   return { ...view, ...(sourceReuse ? { sourceReuse } : {}) };
+}
+
+function boxesIntersect(
+  left: readonly [number, number, number, number],
+  right: readonly [number, number, number, number],
+): boolean {
+  return Math.max(left[0], right[0]) < Math.min(left[2], right[2])
+    && Math.max(left[1], right[1]) < Math.min(left[3], right[3]);
 }
 
 function normalizePath(value: string): string {
@@ -1745,6 +1777,15 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         } else if (coordinateSpace !== "source" && !mappedView) {
           throw new Error("coordinateSpace must be source, last_crop, view_pixels, or view_normalized.");
         }
+        const lockedSelection = loaded.workingState?.selection?.status === "locked"
+          ? loaded.workingState.selection.bbox
+          : undefined;
+        if (lockedSelection && !boxesIntersect(lockedSelection, proposedBbox)) {
+          throw new Error(
+            "The review bbox switches away from the locked target. Keep the review on that candidate or first set grounding_evidence "
+            + "selection to reconsidering with new visible counterevidence.",
+          );
+        }
         if (typeof params.reason !== "string" || params.reason.trim().length < 8) {
           throw new Error("Provide a short visible-evidence reason of at least 8 characters before requesting review.");
         }
@@ -2120,6 +2161,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         promptGuidelines: [
           "facts must contain only direct visible observations. Put interpretations such as 'this dark line is the beak' in hypotheses until structural evidence verifies the object and part. A color match alone never promotes a hypothesis to a fact.",
           "Keep the original query and the user's target requirements intact in state.target; put changing candidate identities in hypotheses, not in place of the requested target. Record hypotheses, open questions and ruled-out candidates concisely, not private deliberation. Before another substantially overlapping view, state what remains unresolved and what visible result would confirm or reject the hypothesis.",
+          "As soon as identity and every required order/relation are established, set state.selection to locked with a rough source-normalized bbox and direct evidence. Locked means no identity or rank check remains; it is not a tentative pick. This limits later views to target boundary measurement. Use reconsidering while comparison is still needed or after naming new visible counterevidence; a generic possibility of hidden candidates is not counterevidence.",
           "Archive only superseded or redundant views after keeping the evidence and counterexamples that matter. Pin overrides archive; the record's original overview stays available. For a comparison image, every panel viewId must be archived before that whole image is omitted.",
         ],
         parameters: Type.Object({
@@ -2132,7 +2174,13 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             facts: Type.Optional(Type.Array(Type.String({ maxLength: 400 }), { maxItems: 8 })),
             hypotheses: Type.Optional(Type.Array(Type.String({ maxLength: 400 }), { maxItems: 8 })),
             openQuestions: Type.Optional(Type.Array(Type.String({ maxLength: 400 }), { maxItems: 8 })),
-            ruledOut: Type.Optional(Type.Array(Type.String({ maxLength: 400 }), { maxItems: 8 })) })),
+            ruledOut: Type.Optional(Type.Array(Type.String({ maxLength: 400 }), { maxItems: 8 })),
+            selection: Type.Optional(Type.Object({
+              status: Type.Union([Type.Literal("locked"), Type.Literal("reconsidering")]),
+              bbox: Type.Optional(Type.Array(Type.Number(), { minItems: 4, maxItems: 4 })),
+              evidence: Type.String({ minLength: 8, maxLength: 400 }),
+            })),
+          })),
           offset: Type.Optional(Type.Integer({ minimum: 0 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
         }),
         executionMode: "sequential",
@@ -2147,6 +2195,12 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           for (const id of params.restore ?? []) loaded.archivedViewIds.delete(id);
           for (const id of params.pin ?? []) loaded.pinnedViewIds.add(id);
           loaded.workingState = state;
+          if (params.state !== undefined) loaded.evidenceRevision += 1;
+          if (state?.selection?.status === "locked" && state.selection.bbox) {
+            loaded.currentBbox = [...state.selection.bbox];
+          } else if (state?.selection?.status === "reconsidering") {
+            loaded.currentBbox = undefined;
+          }
           persistJob();
           const all = loaded.views.list();
           const offset = params.offset ?? 0;
@@ -2154,7 +2208,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             pinned: loaded.pinnedViewIds.has(view.id), archived: loaded.archivedViewIds.has(view.id) && !loaded.pinnedViewIds.has(view.id) }));
           const details = { key, ...groundingTargetReminder(loaded), state: state ?? {}, views, totalViews: all.length,
             nextOffset: offset + views.length < all.length ? offset + views.length : null,
-            note: "Facts are direct observations; hypotheses are unverified object/part interpretations. Color membership never establishes identity. Only explicitly archived image payloads leave subsequent model input; use grounding_view with viewId to inspect a source region again." };
+            note: "Facts are direct observations; hypotheses are unverified object/part interpretations. A selected target limits later views to its region; set selection to reconsidering only when new visible counterevidence requires reopening identity. Color membership never establishes identity. Only explicitly archived image payloads leave subsequent model input; use grounding_view with viewId to inspect a source region again." };
           return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
         },
       });
@@ -2177,6 +2231,12 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         executionMode: "sequential",
         async execute(_id, params) {
           const [key, loaded] = resolveLoadedRecord(params);
+          if (loaded.workingState?.selection?.status === "locked") {
+            throw new Error(
+              "The target candidate is already selected. Use its saved bbox to inspect or measure that target, then submit it for review. "
+              + "Only new visible counterevidence justifies setting grounding_evidence selection to reconsidering before comparing candidates again.",
+            );
+          }
           if (!params.regions.length || params.regions.length > 4) throw new Error("Choose 1–4 regions per comparison image; more comparisons remain available.");
           const modality = params.modality ?? "visible";
           if (!["visible", "infrared", "depth"].includes(modality)) throw new Error("Unknown modality.");
@@ -2230,6 +2290,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "For a crop, choose region and zoom yourself; there is no crop count limit. A region may inspect a small part of the hypothesis. The runtime marks the overlap and reports missing context; compare the full image when selecting among candidates.",
           "The requested region is preserved. If your zoom would exceed the 1600px display limit, only the display magnification is reduced; requestedZoom, magnification, zoomAdjusted and exact source pixel bounds explain the result.",
           "Use one or more focus crops when the target is small, ambiguous, or needs closer inspection. You decide whether to crop, how many crops to request, and the zoom for each crop. The runtime does not force a crop before saving.",
+          "Do not tile the image to rule out merely hypothetical hidden candidates. For an ordinal query, use the overview as the common ordering frame; once enough visible candidates establish the requested rank, record state.selection and stop inspecting candidates that cannot change that rank.",
+          "After state.selection is locked, further crops must intersect that candidate and answer a boundary or requested-part question. To switch candidates, first set selection to reconsidering in grounding_evidence and name the new visible counterevidence; uncertainty by itself is not a reason to restart the search.",
           "For a box read from this display, use its viewId and coordinateSpace view_pixels or view_normalized. Source grid numbers already use source coordinates. last_crop is legacy and refers only to the latest crop.",
           "When repeatedSourceViewId is returned, these source pixels were already examined; explain what new question another rendering answers. Use grounding_compare for identity ambiguity and grounding_evidence to retain facts and archive redundant views, without a fixed crop count.",
           "A crop that reaches the source image border reports touchesSourceEdge, which means no margin exists on that side; do not assume hidden context beyond the reported crop span.",
@@ -2267,6 +2329,15 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             throw new Error("modality must be visible, infrared, or depth.");
           }
           const currentBbox = params.bbox ? validateBoundingBox(params.bbox) : loaded.currentBbox ?? null;
+          const selected = loaded.workingState?.selection?.status === "locked"
+            ? loaded.workingState.selection.bbox
+            : undefined;
+          if (selected && currentBbox && !boxesIntersect(selected, currentBbox)) {
+            throw new Error(
+              "The proposed bbox switches away from the selected target. Keep measuring the selected candidate or first update grounding_evidence "
+              + "to selection status reconsidering with new visible counterevidence.",
+            );
+          }
           const decorations = params.decorations ?? recalled?.decorations ?? "all";
           if (!["none", "grid", "hypothesis", "all"].includes(decorations)) throw new Error("Unknown view decorations.");
           if (params.reason.trim().length < 8) throw new Error("Give a concrete reason for the additional view.");
@@ -2274,13 +2345,24 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           if (loaded.sourcePath !== sourcePath) throw new Error("The requested queryPath does not match the loaded record.");
 
           const requestedRegion = params.region ?? (recalled && !recalled.region.every((value, index) => value === [0, 0, 1, 1][index]) ? recalled.region : undefined);
+          if (selected && !requestedRegion && modality === "visible" && loaded.grantedModalities.has("visible")) {
+            throw new Error(
+              "The visible overview is already available and the target is selected. Inspect a crop intersecting that target or submit it for review.",
+            );
+          }
           if (requestedRegion) {
             if (params.zoom === undefined && !recalled) throw new Error("A crop request must include the model-selected zoom.");
             const zoom = params.zoom ?? Math.max(1, ((recalled!.displayRect?.[2] ?? recalled!.width) - (recalled!.displayRect?.[0] ?? 0)) / (recalled!.sourceWidth * (recalled!.region[2] - recalled!.region[0])));
             const overview = loaded.grantedModalities.has(modality) ? undefined : await loadGroundingImage(sourcePath, loaded.record, modality, readRecordImage, null, false);
             const region = validateBoundingBox(requestedRegion);
+            if (selected && !boxesIntersect(selected, region)) {
+              throw new Error(
+                "This crop is outside the selected target. Inspect that target's boundary or submit it for review. "
+                + "To reopen candidate search, first record new visible counterevidence with grounding_evidence selection status reconsidering.",
+              );
+            }
             const image = await loadGroundingCrop(sourcePath, loaded.record, modality, region, currentBbox, readRecordImage, zoom, decorations);
-            const view = registerGroundingView(loaded, image, decorations);
+            const view = registerGroundingView(loaded, image, decorations, true);
             if (overview) {
               const overviewView = registerGroundingView(loaded, overview, "none");
               loaded.pinnedViewIds.add(overviewView.id);
@@ -2600,13 +2682,14 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "For query datasets, grounding_next_batch returns one record plus its visible image; do not read the full queries.json or re-read an image already attached by a grounding tool. The first image is explicitly stamped CURRENT HYPOTHESIS: NONE.",
           "grounding_next_batch loads at most one record: omit limit or set limit to 1; pass the user's requested total as targetCount instead. If it returns records: [] with remaining: 0, or requestedLimitReached true, stop immediately and do not call it again.",
           "grounding_view can show a hypothesis or grid, or clean pixels with decorations none. Model-chosen focus regions may inspect a smaller part; overlap metadata reports a clipped or outside hypothesis. Oversized zoom is capped to payload dimensions while preserving the region and reporting actual magnification. sourceReuse and decisionCheckpoint identify exact, contained and near-duplicate source pixels; another scale alone is not new evidence.",
+          "Do not tile the scene to disprove hypothetical hidden candidates. The overview is the common frame for candidate count, order and relations. Once visible evidence establishes the requested identity and rank/relation with no remaining identity check, immediately record grounding_evidence state.selection as locked with a rough source bbox. From then on inspect only that candidate's boundary or requested part and proceed to review. While comparison is still required, keep selection reconsidering. Reopen a locked candidate only by setting selection to reconsidering with new visible counterevidence.",
           "When estimating a box inside the last focus crop, pass coordinateSpace last_crop to the save tool instead of manually converting it to full-image coordinates.",
           "Prefer stable viewId plus coordinateSpace view_pixels or view_normalized to manually converting display coordinates. For comparison panels, coordinates refer to the whole composite canvas; the box must be within the chosen panel.",
           "Use grounding_compare to compare candidate identities together with full-image context. Panel magnification does not indicate source object size. grounding_view decorations none returns clean pixels without boxes, grids or labels; bbox is optional during identity selection.",
-          "For ordinal queries such as third from the left, establish which candidates match the requested object, then sort their positions along the specified axis and direction in the same source-image frame. Recompute spatial order whenever a candidate is added, removed or reidentified; discovery order and panel labels are not rank. If the candidate count or order is unsupported, keep the target unresolved instead of inventing an object to satisfy the numeral. The review reason should explain the supported count and order.",
+          "For ordinal queries such as third from the left, establish which visible candidates match the requested object, then sort their positions along the specified axis and direction in the same source-image frame. Objects beyond the selected rank on the irrelevant side cannot change that rank. Do not search empty quadrants for an object merely because one could be hidden; only an actual ambiguous shape or occlusion is grounds for another candidate view. Recompute spatial order when visible evidence adds, removes or reidentifies a candidate. If the candidate count or order is unsupported, keep the target unresolved instead of inventing an object to satisfy the numeral. The review reason should explain the supported count and order.",
           "Across visible, infrared and depth, equal image dimensions do not establish spatial registration or object correspondence. View coordinate mappings do not align sensors. Verify correspondence before transferring a box into the visible review image; conflicting positions or structure are unresolved evidence, not identity confirmation. If identity, requested rank or cross-modal correspondence remains unresolved, use status unresolved with low confidence and explain the missing evidence rather than reporting ok.",
           "Separate target identity, part selection and boundary measurement. Color membership is not object identity: point no_match does not prove absence and largest can be background. Do not invent thermal properties to justify an infrared interpretation.",
-          "Keep a short factual state with grounding_evidence (target, facts, hypotheses, openQuestions, ruledOut). Facts are direct visible observations. Put interpretations such as 'the nearby dark line is the beak' in hypotheses until structure verifies both the object and part. Pin important views; archive redundant images when they add no evidence.",
+          "Keep a short factual state with grounding_evidence (target, facts, hypotheses, openQuestions, ruledOut, selection). Facts are direct visible observations. Put interpretations such as 'the nearby dark line is the beak' in hypotheses until structure verifies both the object and part. A generic possibility that another target may be hidden is not an open question. Pin important views; archive redundant images when they add no evidence.",
           "Every additional view should resolve a specific remaining question. Repeated zoom of the same source pixels cannot add texture. Preserve unresolved alternatives instead of restarting all guesses. A request to analyze past mistakes does not itself request new annotation.",
           "Use grounding_save_and_next between requested records and grounding_save_result for the final record or revision. Each save requires a reason naming visible structural evidence for the chosen identity, part and boundaries. If the proposed box materially moves from the prior candidate, explain the new visible evidence before submitting it. If save_result returns nextAction grounding_next_batch, continue that same job.",
           "The browser review displays the previous and proposed boxes on a clean full image when the candidate changed. The approved prediction edges are saved exactly; never add padding for a small target. Every saved result is returned as a red annotated overlay image.",
