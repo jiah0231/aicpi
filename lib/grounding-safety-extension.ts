@@ -166,7 +166,7 @@ type GroundingImageReader = (
   modality: GroundingModality,
 ) => Promise<GroundingImageSource>;
 
-type GroundingViewDetails = {
+type GroundingViewDetails = ReturnType<typeof groundingTargetReminder> & {
   key: string;
   action: "view" | "crop";
   currentBbox: [number, number, number, number] | null;
@@ -177,6 +177,13 @@ type GroundingViewDetails = {
   sourceReuse?: ReturnType<GroundingViewRegistry["sourceReuse"]>;
   evidenceViewIds?: string[];
 };
+
+function groundingTargetReminder(loaded: LoadedBatchRecord) {
+  return {
+    originalQuery: loaded.record.query ?? "",
+    taskReminder: "Keep every original query constraint. A new candidate or pixel match does not replace the requested target; discovery order is not spatial order. If a required condition lacks support, keep the result unresolved.",
+  };
+}
 
 function recordEvidence() {
   return { views: new GroundingViewRegistry(), pinnedViewIds: new Set<string>(), archivedViewIds: new Set<string>() };
@@ -1396,7 +1403,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         pi.sendMessage({
           customType: "grounding-complete",
           content: completed === total
-            ? `【标注进度】这组数据已完成 ${completed}/${total} 条，没有下一条。\n\n输出目录：${outputDir}\n\n如需修改已保存的框，请说明记录编号或目标；可以重新打开该条，使用局部颜色分析后再次提交人工审核。`
+            ? `【标注进度】这组数据已完成 ${completed}/${total} 条，没有下一条。\n\n输出目录：${outputDir}\n\n如需修改已保存的框，请说明记录编号或目标；可以重新打开该条，根据图像证据修正后再次提交人工审核。`
             : `【标注进度】本次请求已完成 ${sessionSavedCount}/${requestedRecordLimit} 条。数据集累计 ${completed}/${total} 条；本次已停止，不会自动处理其余记录。\n\n输出目录：${outputDir}`,
           display: true,
           details: { completed, total, outputDir },
@@ -1945,14 +1952,16 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       pi.registerTool({
         name: "grounding_color_region",
         label: "Grounding local color analysis",
-        description: "Optional deterministic color-analysis script on original visible-image pixels inside a small region you choose. Useful for measuring a visually identified colored part. Accepts source or stable view coordinates and returns exact source-normalized candidates, the sampled point color, clean crop and mask preview. It cannot decide object/part identity or save a result.",
+        description: "Optional deterministic pixel measurement for a visually identified target or part whose color reliably contrasts with its surroundings and whose boundary needs measurement. Not a default step for every record: skip it when color is unhelpful or the box is already clear. Analyzes only original visible-image pixels in a chosen local region; returns source-normalized color-component bounds, an optional point sample, clean crop and mask preview. It cannot identify the target, recover hidden boundaries, or save a result.",
         promptGuidelines: [
-          "Decide whether color analysis helps; it is optional and uses no extra model. Use a small source-normalized region containing the relevant colored part.",
+          "First inspect the image and establish the requested object/part from shape, structure and surrounding context. Use this optional tool only if reliable local color contrast can answer a remaining pixel-boundary question; neither a color word in the query nor a difficult record requires it. If the box is already clear, proceed to review without color analysis.",
+          "Skip color analysis when identity is unresolved or color does not distinguish the target. Use existing visual evidence, grounding_view or grounding_compare as needed instead. Shadows, lighting, reflections, similar-colored neighbors, low resolution and occlusion can merge or fragment matches; preserve uncertainty rather than forcing a color-derived box.",
+          "Sampling always uses the original visible image, not infrared/depth pixels or their display palettes. A viewId maps coordinates only; it does not change the sampled modality or establish cross-modal alignment. Choose a small ROI around the visually identified part with enough surrounding context to check the boundary.",
           "Use color black/white/gray/red/orange/yellow/green/cyan/blue/purple/pink/brown or #RRGGBB. tolerance (0..1, default .12) broadens matching; #RRGGBB with tolerance 0 matches exact bytes.",
-          "selection largest (default) chooses the largest connected matching patch. point chooses the patch containing your source-normalized point, useful when other same-color objects occur in the region. all unions separated letters/parts only when they belong to the target.",
-          "Inspect selectionAssessment, pointSample, clean and mask previews. No match does not prove target absence and largest can be background. clippedRoiEdges lists artificial clipping that a wider ROI may resolve; touchesSourceEdges lists actual image borders with no pixels beyond them. Do not broaden thresholds just to force a match.",
+          "selection largest (default) chooses the largest connected matching patch, not the most likely target. Black pixels may be shadows or background, not the requested part. point chooses the patch containing your point, but does not verify its identity. all unions separated letters/parts only when visible evidence shows they belong to the target.",
+          "Inspect selectionAssessment, pointSample, clean and mask previews. No match does not prove target absence and largest can be background. A mask filling most of the ROI or reaching several edges calls for checking background/clipping, not increased confidence. clippedRoiEdges lists artificial clipping that a wider ROI may resolve; touchesSourceEdges lists actual image borders with no pixels beyond them. Do not broaden thresholds just to force a match.",
           "When choosing the ROI or point on a returned crop/comparison, pass its viewId with coordinateSpace view_pixels or view_normalized. The runtime maps both region and point to source pixels.",
-          "Returned bbox coordinates are already in full-image source space: pass coordinateSpace source when saving. Submit your chosen/corrected box for human approval; color analysis never auto-saves.",
+          "Returned bbox coordinates enclose only the selected matching pixels, not necessarily the full requested target or part. Check them against the clean image; do not treat missing or occluded pixels as recovered. Coordinates are already in full-image source space: pass coordinateSpace source when saving. Submit your chosen/corrected box for human approval; color analysis never auto-saves.",
         ],
         parameters: Type.Object({
           key: Type.Optional(Type.String({ description: "Optional when exactly one record is loaded" })),
@@ -1987,9 +1996,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const { bytes } = await readRecordImage(loaded.sourcePath, loaded.record, "visible");
           const { rawPreview, maskPreview, ...analysis } = await analyzeGroundingColor(bytes, { ...params, region, point });
           signal?.throwIfAborted();
-          const details = { key, ...analysis, coordinateSpace: "source", inputCoordinateSpace: coordinateSpace,
+          const details = { key, ...groundingTargetReminder(loaded), ...analysis, coordinateSpace: "source", inputCoordinateSpace: coordinateSpace,
             ...(params.viewId ? { inputViewId: params.viewId } : {}), saved: false,
-            note: "Local color measurement only. selectionAssessment.establishesObjectIdentity is always false; verify visible connection to the requested object and part before using a measured box." };
+            note: "Local visible-image color measurement only. selectionAssessment.establishesObjectIdentity is always false. Bounds enclose selected matching pixels, not necessarily the whole target or part; verify identity and boundaries against visible structure, and discard misleading measurements." };
           const view = loaded.views.register({ modality: "visible", region: analysis.region, sourceWidth: analysis.sourceWidth,
             sourceHeight: analysis.sourceHeight, width: analysis.previewWidth, height: analysis.previewHeight, decorations: "none", label: "Color ROI (raw and mask share coordinates)" });
           const evidenceDetails = { ...details, viewId: view.id, coordinateMapping: view, evidenceViewIds: [view.id] };
@@ -2007,7 +2016,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         description: "Keep a short evidence state and choose which views remain in model context. Separate direct visible facts from unverified identity/part hypotheses. Pin useful views, archive superseded images, or restore them; full transcript and user corrections are never deleted.",
         promptGuidelines: [
           "facts must contain only direct visible observations. Put interpretations such as 'this dark line is the beak' in hypotheses until structural evidence verifies the object and part. A color match alone never promotes a hypothesis to a fact.",
-          "Record target, hypotheses, open questions and ruled-out candidates concisely, not private deliberation. Before another substantially overlapping view, state what remains unresolved and what visible result would confirm or reject the hypothesis.",
+          "Keep the original query and the user's target requirements intact in state.target; put changing candidate identities in hypotheses, not in place of the requested target. Record hypotheses, open questions and ruled-out candidates concisely, not private deliberation. Before another substantially overlapping view, state what remains unresolved and what visible result would confirm or reject the hypothesis.",
           "Archive only superseded or redundant views after keeping the evidence and counterexamples that matter. Pin overrides archive; the record's original overview stays available. For a comparison image, every panel viewId must be archived before that whole image is omitted.",
         ],
         parameters: Type.Object({
@@ -2040,7 +2049,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const offset = params.offset ?? 0;
           const views = all.slice(offset, offset + (params.limit ?? 20)).map((view) => ({ ...view,
             pinned: loaded.pinnedViewIds.has(view.id), archived: loaded.archivedViewIds.has(view.id) && !loaded.pinnedViewIds.has(view.id) }));
-          const details = { key, state: state ?? {}, views, totalViews: all.length,
+          const details = { key, ...groundingTargetReminder(loaded), state: state ?? {}, views, totalViews: all.length,
             nextOffset: offset + views.length < all.length ? offset + views.length : null,
             note: "Facts are direct observations; hypotheses are unverified object/part interpretations. Color membership never establishes identity. Only explicitly archived image payloads leave subsequent model input; use grounding_view with viewId to inspect a source region again." };
           return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
@@ -2051,7 +2060,10 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         name: "grounding_compare",
         label: "Grounding candidate comparison",
         description: "Compare model-chosen candidate regions side by side with a clean full-image overview in one image. Useful for identity, ordering and size ambiguity. No object detection: you choose every ROI. Returns one viewId per panel with exact composite-image coordinates; pass that panel viewId and view_pixels/view_normalized when saving a box measured on the comparison.",
-        promptGuidelines: ["Use overview for relations between candidates and detail panels for local parts. Every panel label is outside its pixels; different panel scales must not be used to compare real object size. You may call again with more candidates; the 4-panel limit bounds one image only."],
+        promptGuidelines: [
+          "Use overview for relations between candidates and detail panels for local parts. Every panel label is outside its pixels; different panel scales must not be used to compare real object size. You may call again with more candidates; the 4-panel limit bounds one image only.",
+          "For ordinal queries, establish which candidates satisfy the object description, then order them along the requested axis and direction in a common source-image frame. Panel labels and discovery order are not spatial rank. Recompute the order when a candidate is added, removed or reidentified; do not invent a candidate to satisfy the requested number.",
+        ],
         parameters: Type.Object({
           key: Type.Optional(Type.String()), queryPath: Type.Optional(Type.String()),
           modality: Type.Optional(Type.Union([Type.Literal("visible"), Type.Literal("infrared"), Type.Literal("depth")])),
@@ -2088,7 +2100,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             displayRect: panel.rect, decorations: "none", label: panel.label }));
           grantRecordModality(loaded, modality);
           const repeatedPanels = panels.filter((panel) => panel.sourceReuse);
-          const details = { key, modality, reason: params.reason, overview: overviewView, panels,
+          const details = { key, ...groundingTargetReminder(loaded), modality, reason: params.reason, overview: overviewView, panels,
             evidenceViewIds: [overviewView.id, ...panels.map((view) => view.id)],
             ...(repeatedPanels.length ? { decisionCheckpoint: `${repeatedPanels.length} comparison panel(s) substantially reuse prior source pixels. Record what changed before repeating the same identity comparison.` } : {}),
             note: "Use one panel's viewId. view_pixels and view_normalized refer to this WHOLE comparison canvas; the box must lie inside that panel's displayRect. Source coordinates use coordinateSpace source. Panels may have different display scales." };
@@ -2104,6 +2116,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         promptSnippet: "View an additional modality or a model-selected zoom crop with the current bbox marked",
         promptGuidelines: [
           "Visible is already attached by grounding_next_batch. Request infrared or depth only when the query or visible ambiguity requires it.",
+          "Equal image dimensions do not prove cross-modal alignment. Establish object correspondence and spatial registration before transferring an infrared/depth box to the visible image used for review. A viewId maps display coordinates within its modality, not between sensors. Conflicting positions or structure remain unresolved evidence, not confirmation of identity.",
           "bbox is an optional working hypothesis, not evidence. Omit it while choosing the target; decorations none removes the grid, box and labels without changing pixels or coordinate metadata.",
           "For a crop, choose region and zoom yourself; there is no crop count limit. A region may inspect a small part of the hypothesis. The runtime marks the overlap and reports missing context; compare the full image when selecting among candidates.",
           "The requested region is preserved. If your zoom would exceed the 1600px display limit, only the display magnification is reduced; requestedZoom, magnification, zoomAdjusted and exact source pixel bounds explain the result.",
@@ -2136,6 +2149,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         async execute(_toolCallId, params) {
           if (!active) throw new Error("Grounding runtime safety is not active for this session.");
           const [key, loaded] = resolveLoadedRecord(params);
+          const targetReminder = groundingTargetReminder(loaded);
           const recalled = params.viewId ? loaded.views.get(params.viewId) : undefined;
           if (params.viewId && !recalled) throw new Error("Unknown or stale viewId. List current record views with grounding_evidence, or request a new region.");
           if (recalled && params.region) throw new Error("Use either viewId or region, not both.");
@@ -2169,6 +2183,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             persistJob();
             const details: GroundingViewDetails = {
               key,
+              ...targetReminder,
               action: "crop",
               currentBbox,
               modality,
@@ -2182,7 +2197,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             };
             return {
               content: [
-                { type: "text" as const, text: JSON.stringify({ key, focused: modality, currentBbox, viewId: view.id, requestedZoom: zoom,
+                { type: "text" as const, text: JSON.stringify({ key, ...targetReminder, focused: modality, currentBbox, viewId: view.id, requestedZoom: zoom,
                   reason: params.reason, ...(view.sourceReuse ? { sourceReuse: view.sourceReuse,
                     decisionCheckpoint: "This rendering mostly reuses prior source pixels. State the unresolved question and update grounding_evidence before requesting another overlapping view." } : {}) }) },
                 ...(overview?.content ?? []),
@@ -2202,6 +2217,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           persistJob();
           const details: GroundingViewDetails = {
             key,
+            ...targetReminder,
             action: "view",
             currentBbox,
             modality,
@@ -2213,7 +2229,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           };
           return {
             content: [
-              { type: "text" as const, text: JSON.stringify({ key, viewed: modality, currentBbox, viewId: view.id, reason: params.reason,
+              { type: "text" as const, text: JSON.stringify({ key, ...targetReminder, viewed: modality, currentBbox, viewId: view.id, reason: params.reason,
                 ...(view.sourceReuse ? { sourceReuse: view.sourceReuse,
                   decisionCheckpoint: "This rendering mostly reuses prior source pixels. State the unresolved question and update grounding_evidence before requesting another overlapping view." } : {}) }) },
               ...image.content,
@@ -2232,6 +2248,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Prefer grounding_save_and_next between requested records; use grounding_save_result for the last record or a revision. If a known job still has requested records, this tool returns nextAction grounding_next_batch instead of ending the batch.",
           "This tool waits for the user's review without a timeout. Never confirm on the user's behalf or treat a rejected candidate as complete.",
           "Provide reason with the direct visible evidence that connects this box to the requested object and part. A color match alone is not sufficient. Material movement from the prior working box is shown to the reviewer.",
+          "Before submitting, reconcile the proposed target with the original query and user requirements, including any required identity, attribute, relation or order. Explain the evidence for those requirements; for ordinal targets include the supported count and spatial order. If a required condition or cross-modal correspondence remains unestablished, use status unresolved with low confidence and state what is missing. A measured box is not proof that the request is satisfied.",
           "If bbox coordinates were measured against the last grounding_view crop, set coordinateSpace to last_crop so the runtime maps them back to the full source image.",
           "Do not write grounding progress or submission files with write, edit, bash, or powershell.",
           "The result returns an overlay image of the saved box and, for a small box, an automatic magnified verification crop; confirm the box sits on the target in those images.",
@@ -2275,6 +2292,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         promptGuidelines: [
           "Use grounding_save_and_next between records. It blocks for manual review; the user must approve before any later record is loaded. Rejection means revise the same record.",
           "Provide reason with direct visible evidence for target identity, owning object and requested part. If the candidate moved materially, explain the new evidence that caused the change.",
+          "Before submitting, reconcile the proposed target with the original query and user requirements, including any required identity, attribute, relation or order. Explain the evidence for those requirements; for ordinal targets include the supported count and spatial order. If a required condition or cross-modal correspondence remains unestablished, use status unresolved with low confidence and state what is missing. A measured box is not proof that the request is satisfied.",
           "If bbox coordinates were measured against the last grounding_view crop, set coordinateSpace to last_crop so the runtime maps them back to the full source image.",
           "Use grounding_save_result for the last requested record.",
           "The result returns an overlay image of the saved box and, for a small box, an automatic magnified verification crop; confirm the box sits on the target in those images.",
@@ -2370,7 +2388,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             customType: "grounding-required-save",
             display: false,
             content: `Grounding record ${key} is still unsaved. Do not end the turn. `
-              + "Use the image already in context, choose the best-supported single normalized bbox, and call grounding_save_result or grounding_save_and_next now.",
+              + `Original query: ${JSON.stringify(loaded.record.query ?? "")}. `
+              + "Use the image already in context and reconcile the best-supported single normalized bbox with all original query requirements before calling grounding_save_result or grounding_save_and_next. If a required condition remains unestablished, submit it as unresolved with low confidence and explain what is missing.",
           }],
           continue: true,
         };
@@ -2464,8 +2483,10 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Runtime grounding safety is active.",
           lastJob ? `Current dataset: ${lastJob.queryPath}. Current output directory: ${lastJob.outputDir}.` : "",
           `Job state: ${JSON.stringify(jobSnapshot())}.`,
+          "Keep the original query and the user's task requirements as the target throughout observation, candidate changes and review. A newly noticed object, working hypothesis or convenient tool result must not silently replace the requested object or drop a required attribute, relation or order. Before submitting a box, reconcile the proposal with every requirement actually present in the request and explain the supporting evidence. If a requirement is unestablished or contradicted, state what is unresolved and use low confidence with status unresolved instead of reinterpreting the query to fit the candidate. Pixel measurements alone do not establish that the request is satisfied.",
           "For continue/status questions, call grounding_status instead of listing directories. If remaining is zero, explain the dataset is complete; do not claim to begin the first record again. For a user-requested correction, find the key in grounding_status and call grounding_reopen_record, then submit the revised box for human review. Do not treat your run's saved predictions as reference annotations.",
-          "Local color-analysis scripts are allowed and provided by grounding_color_region: use it optionally to measure black or colored pixels within a small chosen region. Inspect selectionAssessment and pointSample. They report pixel membership only and never establish which object or body part was measured. No extra model or shell/file enumeration is needed.",
+          "grounding_color_region is an optional local pixel-measurement aid, not a required step for every record or every colored target. First establish object/part identity from the image and context. Use it only when reliable local color contrast helps resolve a remaining boundary question; skip it if the box is clear or color is unhelpful. For unresolved identity, inspect existing evidence or use grounding_view/grounding_compare as needed. Uncertainty is preferable to a forced color match. No extra model or shell/file enumeration is needed.",
+          "Color analysis samples only the original visible image; infrared/depth palettes and viewId coordinate mapping do not supply color or alignment evidence. Lighting, shadows, reflections, similar colors, low resolution and occlusion can make a mask misleading. Inspect selectionAssessment, pointSample and clean/mask previews when using it. Measured bounds cover matching pixels only, not necessarily the complete target, and cannot recover hidden boundaries.",
           "Human review is mandatory for every record, including unresolved and low-confidence results. Save tools display the current box and wait for the user to approve it. Never approve on the user's behalf. Only an approved record may be saved or followed by another record; rejection means revise that same record and request review again. Waiting for the user is a valid pause, not an error or a reason to retry.",
           "The runtime sanitizes query JSON and blocks reference annotations and prior annotated artifacts.",
           "For query datasets, grounding_next_batch returns one record plus its visible image; do not read the full queries.json or re-read an image already attached by a grounding tool. The first image is explicitly stamped CURRENT HYPOTHESIS: NONE.",
@@ -2474,6 +2495,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "When estimating a box inside the last focus crop, pass coordinateSpace last_crop to the save tool instead of manually converting it to full-image coordinates.",
           "Prefer stable viewId plus coordinateSpace view_pixels or view_normalized to manually converting display coordinates. For comparison panels, coordinates refer to the whole composite canvas; the box must be within the chosen panel.",
           "Use grounding_compare to compare candidate identities together with full-image context. Panel magnification does not indicate source object size. grounding_view decorations none returns clean pixels without boxes, grids or labels; bbox is optional during identity selection.",
+          "For ordinal queries such as third from the left, establish which candidates match the requested object, then sort their positions along the specified axis and direction in the same source-image frame. Recompute spatial order whenever a candidate is added, removed or reidentified; discovery order and panel labels are not rank. If the candidate count or order is unsupported, keep the target unresolved instead of inventing an object to satisfy the numeral. The review reason should explain the supported count and order.",
+          "Across visible, infrared and depth, equal image dimensions do not establish spatial registration or object correspondence. View coordinate mappings do not align sensors. Verify correspondence before transferring a box into the visible review image; conflicting positions or structure are unresolved evidence, not identity confirmation. If identity, requested rank or cross-modal correspondence remains unresolved, use status unresolved with low confidence and explain the missing evidence rather than reporting ok.",
           "Separate target identity, part selection and boundary measurement. Color membership is not object identity: point no_match does not prove absence and largest can be background. Do not invent thermal properties to justify an infrared interpretation.",
           "Keep a short factual state with grounding_evidence (target, facts, hypotheses, openQuestions, ruledOut). Facts are direct visible observations. Put interpretations such as 'the nearby dark line is the beak' in hypotheses until structure verifies both the object and part. Pin important views; archive redundant images when they add no evidence.",
           "Every additional view should resolve a specific remaining question. Repeated zoom of the same source pixels cannot add texture. Preserve unresolved alternatives instead of restarting all guesses. A request to analyze past mistakes does not itself request new annotation.",

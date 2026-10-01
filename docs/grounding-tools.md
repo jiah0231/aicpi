@@ -4,6 +4,30 @@ Every prediction still requires explicit browser approval before it is saved.
 Rejection keeps the same record. Cropping and color analysis remain optional,
 with no per-record crop quota. No detector, OCR model or extra vision model is used.
 
+## Preserve the requested target
+
+The original query and the user's task requirements remain the target throughout
+observation, candidate changes and review. A new object, a convenient color mask
+or another tool result must not silently replace the requested object or drop a
+required attribute, relation or order. Keep those requirements in the evidence
+state's `target`; changing candidate interpretations belong in `hypotheses`.
+
+Before submitting a box, reconcile the proposal with the requirements actually
+present in the request and explain the supporting evidence. Measuring a region
+only establishes pixel bounds, not that it satisfies the query. If a required
+condition is unestablished or contradicted, preserve that uncertainty, explain
+what is missing and submit the best-supported candidate as `unresolved` with
+low confidence. Do not reinterpret the query to fit the easiest candidate.
+This is a reasoning obligation, not a fixed list of extra tool calls; a clear
+case can proceed directly to human review.
+
+View/crop, comparison, color-analysis and evidence responses repeat `originalQuery`
+from the loaded source record with a short `taskReminder`. This stays separate
+from the model's editable working state, so a changed hypothesis cannot rewrite
+the reminder. The unsaved-record nudge also repeats the source query and allows
+an unresolved submission. These reminders reinforce the task; they do not
+automatically prove candidate identity or query satisfaction.
+
 ## Job scope and continuation
 
 Start with `grounding_next_batch` and provide `queryPath`, a dedicated `outputDir`,
@@ -62,6 +86,30 @@ Example tool arguments (coordinates are illustrative, not predictions):
 }
 ```
 
+### Ordinal targets and cross-modal evidence
+
+For queries such as "third from the left", first establish which candidates
+match the requested object description, then sort their positions along the
+specified axis and direction in a common source-image frame. Recompute spatial
+order whenever a candidate is added, removed or reidentified. Discovery order
+and comparison panel labels are not rank. For example, if three verified objects
+have horizontal centers at 0.24, 0.49 and 0.74, their left-to-right ranks are
+1, 2 and 3 even if the middle object was discovered last. Do not invent or promote
+an uncertain object just to satisfy the requested numeral.
+
+Visible, infrared and depth images with the same dimensions are not necessarily
+spatially registered. Establish object correspondence and alignment before
+transferring an infrared/depth box into the visible image used for review.
+`viewId` coordinate mapping converts a display location to its own modality's
+source frame; it does not align sensors. Conflicting positions or structure are
+unresolved evidence, not confirmation that both views show the same target.
+
+When identity, the requested rank or cross-modal correspondence remains
+unresolved, submit the best-supported candidate as `unresolved` with low
+confidence and explain what is missing. A measured box does not justify `ok`.
+For ordinal targets, the review reason should explain the supported candidate
+count and spatial order so the user can check the interpretation.
+
 ## Stable coordinates
 
 Each returned view has an ID valid for its loaded record. Save tools accept:
@@ -100,10 +148,43 @@ of its view IDs are archived; pinning takes precedence. The on-disk transcript
 is not rewritten. View IDs and active evidence selections are wrapper-local;
 the concise evidence state and current box survive a wrapper restart.
 
-Changing display scale does not produce more source detail. For identity uncertainty, compare candidates;
-for a known part's uncertain boundary, measure pixels. Avoid repeated threshold
-changes merely to obtain a match. A no-match point selection does not prove
-absence, and the largest matching component can be background.
+Changing display scale does not produce more source detail. First inspect the
+target's shape, structure and surrounding context. If identity remains uncertain,
+use the existing evidence or `grounding_view` / `grounding_compare` as needed;
+color matching cannot resolve object or body-part identity on its own.
+
+`grounding_color_region` is optional, not a stage to run for every record, colored
+target, correction, or difficult example. Consider it only when an identified
+target or part has reliable local color contrast and measuring its matching
+pixels would help answer a remaining boundary question. If the box is already
+clear or color is not discriminative, skip color analysis and use the visual
+evidence to submit the box for review. Unresolved alternatives and low confidence
+are valid; no color-derived box needs to be forced.
+
+The tool always samples the original **visible** image. Infrared/depth colors may
+be display palettes, not the target's visible color. A `viewId` maps coordinates
+only; it neither switches the sampled modality nor proves cross-modal alignment.
+Lighting, shadows, reflections, similarly colored neighbors, low resolution and
+occlusion can merge, fragment or hide the relevant pixels. A mask measures only
+the pixels that match; its bounds are not necessarily the complete target's
+bounds and cannot recover hidden boundaries.
+
+For example, a visually identified red label against a clearly different local
+background may benefit from color measurement if its edges are hard to place.
+A dark bird's beak beside a shadow, several similar-colored objects, or a target
+identified mainly through an infrared signature should not trigger color analysis
+by default. Inspect structure and the relevant modality instead.
+
+When color measurement is useful, choose a small ROI with enough context to check
+the boundary. Inspect the clean image, mask, point sample and selection assessment
+before using any measured box. `largest` selects the largest matching component,
+not the most likely target; black pixels can be background or shadow. `point`
+confirms pixel membership, not identity, and a no-match point does not prove
+target absence. Use `all` only when visible evidence supports grouping the
+separated matching parts. A mask filling most of the ROI or reaching several
+edges calls for checking background/clipping, not increased confidence. Avoid
+repeated threshold changes merely to obtain a match, and discard a misleading
+mask rather than treating it as stronger evidence than the image.
 
 `grounding_color_region` accepts `source`, `view_pixels`, and `view_normalized`
 coordinates for both the ROI and optional point. It returns `pointSample` with
