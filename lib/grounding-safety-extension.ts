@@ -2062,12 +2062,12 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         parameters: Type.Object({
           key: Type.Optional(Type.String({ description: "Optional when exactly one record is loaded" })),
           queryPath: Type.Optional(Type.String({ description: "Optional; defaults to the loaded record's dataset" })),
-          region: Type.Tuple([Type.Number(), Type.Number(), Type.Number(), Type.Number()], { description: "Small ROI in coordinateSpace; source-normalized by default, or coordinates on viewId" }),
+          region: Type.Array(Type.Number(), { minItems: 4, maxItems: 4, description: "Small ROI in coordinateSpace; source-normalized by default, or coordinates on viewId" }),
           color: Type.String({ description: "Named color preset or #RRGGBB" }),
           tolerance: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
           minAreaPixels: Type.Optional(Type.Integer({ minimum: 1 })),
           selection: Type.Optional(Type.Union([Type.Literal("largest"), Type.Literal("all"), Type.Literal("point")])),
-          point: Type.Optional(Type.Tuple([Type.Number(), Type.Number()], { description: "Required for point selection; uses the same coordinateSpace and viewId as region" })),
+          point: Type.Optional(Type.Array(Type.Number(), { minItems: 2, maxItems: 2, description: "Required for point selection; uses the same coordinateSpace and viewId as region" })),
           coordinateSpace: Type.Optional(Type.Union([Type.Literal("source"), Type.Literal("view_pixels"), Type.Literal("view_normalized")])),
           viewId: Type.Optional(Type.String({ description: "Required with view_pixels or view_normalized; must belong to the current record" })),
         }),
@@ -2085,10 +2085,10 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           if (coordinateSpace === "source" && params.viewId) throw new Error("viewId is only used with view_pixels or view_normalized color coordinates.");
           const region = mappedView
             ? loaded.views.toSource(params.viewId!, params.region, coordinateSpace)
-            : params.region;
+            : params.region as [number, number, number, number];
           const point = params.point && mappedView
             ? loaded.views.toSourcePoint(params.viewId!, params.point, coordinateSpace)
-            : params.point;
+            : params.point as [number, number] | undefined;
           const { bytes } = await readRecordImage(loaded.sourcePath, loaded.record, "visible");
           const { rawPreview, maskPreview, ...analysis } = await analyzeGroundingColor(bytes, { ...params, region, point });
           signal?.throwIfAborted();
@@ -2171,7 +2171,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           key: Type.Optional(Type.String()), queryPath: Type.Optional(Type.String()),
           modality: Type.Optional(Type.Union([Type.Literal("visible"), Type.Literal("infrared"), Type.Literal("depth")])),
           regions: Type.Array(Type.Object({ label: Type.String({ minLength: 1, maxLength: 80 }),
-            region: Type.Tuple([Type.Number(), Type.Number(), Type.Number(), Type.Number()]) }), { minItems: 1, maxItems: 4 }),
+            region: Type.Array(Type.Number(), { minItems: 4, maxItems: 4 }) }), { minItems: 1, maxItems: 4 }),
           reason: Type.String({ minLength: 8 }),
         }),
         executionMode: "sequential",
@@ -2240,12 +2240,11 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           modality: Type.Optional(Type.String({ description: "visible (default), infrared, or depth" })),
           viewId: Type.Optional(Type.String({ description: "Recall an earlier source region from this record; do not also specify region. A fresh viewId will describe the newly rendered display." })),
           decorations: Type.Optional(Type.Union([Type.Literal("none"), Type.Literal("grid"), Type.Literal("hypothesis"), Type.Literal("all")])),
-          bbox: Type.Optional(Type.Tuple([
-            Type.Number(),
-            Type.Number(),
-            Type.Number(),
-            Type.Number(),
-          ], { description: "Optional source-normalized working hypothesis; omit when target identity is not established" })),
+          bbox: Type.Optional(Type.Array(Type.Number(), {
+            minItems: 4,
+            maxItems: 4,
+            description: "Optional source-normalized working hypothesis; omit when target identity is not established",
+          })),
           zoom: Type.Optional(Type.Number({ minimum: 1, description: "Model-selected crop magnification; required with region. Oversized display is capped to 1600px while retaining the whole region and reporting the effective magnification." })),
           region: Type.Optional(Type.Array(Type.Number(), {
             minItems: 4,
@@ -2366,7 +2365,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           queryPath: Type.String({ description: "Path to the source queries.json" }),
           outputDir: Type.String({ description: "Dedicated output directory outside the source dataset. Use the same new or empty directory as grounding_next_batch." }),
           key: Type.String(),
-          bbox: Type.Tuple([Type.Number(), Type.Number(), Type.Number(), Type.Number()]),
+          bbox: Type.Array(Type.Number(), { minItems: 4, maxItems: 4 }),
           status: Type.Union([Type.Literal("ok"), Type.Literal("low_confidence"), Type.Literal("unresolved")]),
           confidence: Type.Number({ minimum: 0, maximum: 1 }),
           reason: Type.String({ minLength: 8, maxLength: 800, description: "Direct visible evidence linking the box to the requested object and part; do not cite color alone" }),
@@ -2410,7 +2409,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           queryPath: Type.String({ description: "Path to the source queries.json" }),
           outputDir: Type.String({ description: "Dedicated output directory outside the source dataset. Use a new or empty directory; an existing progress.jsonl written by another build cannot be resumed." }),
           key: Type.String(),
-          bbox: Type.Tuple([Type.Number(), Type.Number(), Type.Number(), Type.Number()]),
+          bbox: Type.Array(Type.Number(), { minItems: 4, maxItems: 4 }),
           status: Type.Union([Type.Literal("ok"), Type.Literal("low_confidence"), Type.Literal("unresolved")]),
           confidence: Type.Number({ minimum: 0, maximum: 1 }),
           reason: Type.String({ minLength: 8, maxLength: 800 }),
