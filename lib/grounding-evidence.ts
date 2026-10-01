@@ -23,6 +23,7 @@ export type GroundingEvidenceOptions = {
   active: boolean;
   pinnedViewIds: readonly string[];
   archivedViewIds: readonly string[];
+  maxImageBase64Characters?: number;
 };
 
 /** Validate a concise evidence notebook, not a request for private reasoning. */
@@ -103,11 +104,13 @@ function evidenceViewIds(details: unknown): string[] | undefined {
 }
 
 /**
- * Build provider context without modifying the transcript. Only explicit model
- * archival removes images; no image count, age, zoom, or recency policy applies.
- * A result containing multiple views is retained until all are archived, because
- * its image blocks need not correspond one-to-one with its view IDs. Pinned views
- * always win. Unmarked overview/load images therefore remain available.
+ * Build provider context without modifying the transcript. Explicit model
+ * archival removes images first. When the remaining grounding images exceed a
+ * transport budget, older unpinned view results are omitted until the request
+ * fits; the newest such result is retained so the model can inspect the pixels
+ * it just requested. A result containing multiple views is handled as one unit,
+ * because its image blocks need not correspond one-to-one with its view IDs.
+ * Pinned views and unmarked overview/load images always remain available.
  *
  * Keep every message and every non-image block in order. In particular signed
  * thinking blocks, sibling tool calls/results, and user corrections are untouched.
@@ -116,11 +119,11 @@ export function compactGroundingEvidence(
   messages: AgentMessage[],
   options: GroundingEvidenceOptions,
 ): AgentMessage[] {
-  if (!options.active || options.archivedViewIds.length === 0) return messages;
+  if (!options.active || (options.archivedViewIds.length === 0 && options.maxImageBase64Characters === undefined)) return messages;
   const archived = new Set(options.archivedViewIds);
   const pinned = new Set(options.pinnedViewIds);
 
-  return messages.map((message) => {
+  const compacted = messages.map((message) => {
     if (message.role !== "toolResult" || !message.toolName.startsWith("grounding_")) return message;
     const ids = evidenceViewIds(message.details);
     if (!ids || ids.some((id) => !archived.has(id) || pinned.has(id))) return message;
@@ -133,4 +136,36 @@ export function compactGroundingEvidence(
     }
     return { ...message, content };
   });
+
+  const budget = options.maxImageBase64Characters;
+  if (budget === undefined || !Number.isFinite(budget) || budget < 0) return compacted;
+  const imageCharacters = (message: AgentMessage) => message.role === "toolResult"
+    ? message.content.reduce((sum, block) => sum + (block.type === "image" ? block.data.length : 0), 0)
+    : 0;
+  let total = compacted.reduce((sum, message) => sum + imageCharacters(message), 0);
+  if (total <= budget) return compacted;
+
+  const candidates = compacted.flatMap((message, index) => {
+    if (message.role !== "toolResult" || !message.toolName.startsWith("grounding_")) return [];
+    const ids = evidenceViewIds(message.details);
+    const size = imageCharacters(message);
+    if (!ids || size === 0 || ids.some((id) => pinned.has(id))) return [];
+    return [{ index, ids, size }];
+  });
+  // The latest view is the model's current observation. Older views are safe
+  // to request again from the registry if the concise evidence state proves
+  // insufficient later.
+  const removable = candidates.slice(0, -1);
+  if (removable.length === 0) return compacted;
+  const bounded = [...compacted];
+  for (const candidate of removable) {
+    if (total <= budget) break;
+    const message = bounded[candidate.index];
+    if (message.role !== "toolResult") continue;
+    const content = message.content.filter((block) => block.type !== "image");
+    content.push({ type: "text", text: `Earlier grounding evidence image omitted from active model context to stay within the request-size limit: ${candidate.ids.join(", ")}. Reopen that view if its pixels are still needed.` });
+    bounded[candidate.index] = { ...message, content };
+    total -= candidate.size;
+  }
+  return bounded;
 }

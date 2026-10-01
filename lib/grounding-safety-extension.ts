@@ -46,7 +46,13 @@ const IMAGE_MAX_ZOOM = 12;
 // it. Keep every model-facing preview below one bounded base64 size even when
 // the SDK image resizer is unavailable. Original bytes are still used for
 // crops, color analysis and saved source coordinates.
-const GROUNDING_PREVIEW_MAX_BASE64_CHARS = 1_250_000;
+const GROUNDING_PREVIEW_MAX_BASE64_CHARS = 400_000;
+// Keep enough headroom for the system prompt, tool schemas and ordinary
+// conversation text on gateways with a roughly 1 MB request-body limit. The
+// transcript keeps every image; the context hook may omit older, unpinned
+// views from a provider request once their combined encoded size reaches this
+// budget.
+const GROUNDING_CONTEXT_MAX_BASE64_CHARS = 800_000;
 const GROUNDING_PREVIEW_JPEG_QUALITIES = [82, 70, 58, 46, 38, 30] as const;
 const CROP_GRID_STEPS = [0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2] as const;
 const CROP_GRID_MAX_LINES = 8;
@@ -1598,7 +1604,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         const current = loadedBatchRecords.values().next().value as LoadedBatchRecord | undefined;
         const completedContext = compactCompletedGroundingContext(event.messages, loadedBatchRecords.size > 0);
         const messages = current ? compactGroundingEvidence(completedContext, { active: true,
-          pinnedViewIds: [...current.pinnedViewIds], archivedViewIds: [...current.archivedViewIds] }) : completedContext;
+          pinnedViewIds: [...current.pinnedViewIds], archivedViewIds: [...current.archivedViewIds],
+          maxImageBase64Characters: GROUNDING_CONTEXT_MAX_BASE64_CHARS }) : completedContext;
         return messages === event.messages ? undefined : { messages };
       });
 
