@@ -10,6 +10,7 @@ import { countToolCallBlocks, getAssistantErrorMessage, getDisplayableAssistantB
 import { extractTurnWrittenFiles, type WrittenFile } from "@/lib/turn-written-files";
 import { buildQuotedSelection } from "@/lib/quoted-selection";
 import { MessageView } from "./MessageView";
+import { GroundingReviewPanel, type GroundingReviewRequest } from "./GroundingReviewPanel";
 import { MarkdownBody } from "./MarkdownBody";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
@@ -984,7 +985,10 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
         {extensionDialog && (
           <ExtensionDialog key={extensionDialog.id} request={extensionDialog} onRespond={respondToExtensionUi} />
         )}
-        {extensionCustomUi && (
+        {extensionCustomUi && extensionCustomUi.details?.kind === "grounding_review" && (
+          <GroundingReviewPanel key={extensionCustomUi.id} request={extensionCustomUi as GroundingReviewRequest} onInput={sendExtensionCustomInput} />
+        )}
+        {extensionCustomUi && extensionCustomUi.details?.kind !== "grounding_review" && (
           <ExtensionCustomPanel key={extensionCustomUi.id} request={extensionCustomUi} onInput={sendExtensionCustomInput} />
         )}
         {!isEmptyNew && <>

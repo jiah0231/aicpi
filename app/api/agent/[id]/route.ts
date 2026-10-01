@@ -1,6 +1,25 @@
 import { NextResponse } from "next/server";
 import { resolveSessionPath } from "@/lib/session-reader";
 import { startRpcSession, getRpcSession, setRpcSessionTools } from "@/lib/rpc-manager";
+function errorStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const candidate = error as { status?: unknown; statusCode?: unknown; response?: { status?: unknown } };
+  for (const value of [candidate.status, candidate.statusCode, candidate.response?.status]) {
+    if (typeof value === "number" && Number.isInteger(value) && value >= 400 && value <= 599) return value;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  const match = message.match(/\b(?:HTTP\s+|status\s*[:=]?\s*)(4\d\d|5\d\d)\b/i);
+  return match ? Number(match[1]) : undefined;
+}
+
+function errorCode(error: unknown, status: number): string | undefined {
+  if (error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string") {
+    return (error as { code: string }).code;
+  }
+  if (status === 413) return "payload_too_large";
+  if (status >= 400) return "backend_http_error";
+  return undefined;
+}
 
 // POST /api/agent/[id] - Send a command to an existing session
 export async function POST(
@@ -25,6 +44,16 @@ export async function POST(
 
     // Fast path: already-running session
     const existing = getRpcSession(id);
+    // Abort is a lifecycle command, not a reason to reopen a session. Handle
+    // it before the normal start path so an idle wrapper cannot be resurrected
+    // just to receive a no-op cancellation.
+    if (body.type === "abort") {
+      if (existing?.isAlive()) {
+        if (existing.isRunning()) await existing.send(body);
+        await existing.shutdown();
+      }
+      return NextResponse.json({ success: true, data: null });
+    }
     if (body.type === "set_tools") {
       const filePath = existing?.sessionFile || await resolveSessionPath(id) || undefined;
       if (!existing?.isAlive() && !filePath) {
@@ -60,12 +89,14 @@ export async function POST(
 
     return NextResponse.json({ success: true, data: result });
   } catch (error) {
+    const status = errorStatus(error) ?? 500;
+    const code = errorCode(error, status);
     return NextResponse.json({
       error: error instanceof Error ? error.message : String(error),
       ...(commandType === "prompt" && !promptAccepted
         ? { code: "prompt_rejected", accepted: false }
-        : {}),
-    }, { status: 500 });
+        : code ? { code } : {}),
+    }, { status });
   }
 }
 

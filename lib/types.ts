@@ -131,6 +131,61 @@ export interface SystemMessage {
 /** Any message a `message` entry can store, including transcript system messages. */
 export type SessionMessage = AgentMessage | SystemMessage;
 
+export interface GroundingReviewImage {
+  data: string;
+  mimeType: string;
+  originalWidth: number;
+  originalHeight: number;
+  width?: number;
+  height?: number;
+}
+export type GroundingReviewStatus = "ok" | "low_confidence" | "unresolved";
+export interface GroundingCandidateChange {
+  previousBbox: [number, number, number, number];
+  iou: number;
+  centerDeltaPixels: [number, number];
+  edgeDeltaPixels: [number, number, number, number];
+  areaRatio: number;
+  materialChange: boolean;
+  note: string;
+}
+export interface GroundingReviewDetails {
+  kind: "grounding_review";
+  key: string;
+  query: string;
+  bbox: [number, number, number, number];
+  rawBbox?: [number, number, number, number];
+  previousBbox?: [number, number, number, number];
+  candidateChange?: GroundingCandidateChange;
+  status: GroundingReviewStatus;
+  confidence: number;
+  targetFound: boolean;
+  candidateCount: number;
+  candidateRank?: number;
+  expectedOrdinal?: number;
+  reason: string;
+  image: GroundingReviewImage;
+  availableModalities: Array<"visible" | "infrared" | "depth">;
+  canContinue?: boolean;
+  expiresAt?: number;
+}
+export type GroundingReviewResponse =
+  | {
+      type: "grounding_review_response";
+      action: "confirm";
+      bbox: [number, number, number, number];
+      status: GroundingReviewStatus;
+      confidence: number;
+      targetFound: boolean;
+      candidateCount: number;
+      candidateRank?: number;
+      reason: string;
+    }
+  | {
+      type: "grounding_review_response";
+      action: "reject";
+      reason: string;
+    };
 export type ExtensionUiRequest =
   | {
       type: "extension_ui_request";
@@ -208,6 +263,7 @@ export type ExtensionUiRequest =
       method: "custom";
       lines: string[];
       closed?: boolean;
+      details?: GroundingReviewDetails;
     };
 
 export type BlockingExtensionUiRequest = Extract<

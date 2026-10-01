@@ -956,14 +956,30 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const sendExtensionCustomInput = useCallback(async (request: ExtensionUiCustomRequest, data: string) => {
     const sid = sessionIdRef.current;
-    if (!sid) return;
+    const isGroundingReview = request.details?.kind === "grounding_review";
+    if (!sid) {
+      if (isGroundingReview) throw new Error("会话已断开，请重新打开当前会话后重试。");
+      return;
+    }
     try {
-      await sendAgentCommand(sid, {
+      const result = await sendAgentCommand<{ accepted: boolean; closed: boolean }>(sid, {
         type: "extension_ui_input",
         id: request.id,
         data,
       });
+      if (isGroundingReview && sessionIdRef.current === sid) {
+        if (result?.closed) {
+          // HTTP acknowledgement also closes the matching review when its SSE
+          // close event was lost. A late reply must not remove the next review.
+          setExtensionCustomUi((current) => current?.id === request.id ? null : current);
+        } else if (result?.accepted === false) {
+          throw new Error("审核未提交，请检查标注信息后重试。");
+        }
+      }
     } catch (e) {
+      // The grounding panel awaits acknowledgement and shows failures inline.
+      // Terminal custom UIs retain their existing fire-and-forget behavior.
+      if (isGroundingReview) throw e;
       console.error("Failed to send extension custom UI input:", e);
     }
   }, []);
@@ -1515,6 +1531,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         break;
       case "extension_ui_closed":
         setExtensionDialog((current) => current?.id === event.id ? null : current);
+        setExtensionCustomUi((current) => current?.id === event.id ? null : current);
         break;
     }
   }, [addNotice, cancelEventStreamGrace, handleExtensionUiRequest, loadSession, notifyPromptStage, onAgentEnd, scheduleEventStreamClose, scrollToBottom, settleUiStage, syncLiveModel]);

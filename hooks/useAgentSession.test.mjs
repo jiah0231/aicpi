@@ -8,6 +8,47 @@ const chatWindowSource = await jitiSource(new URL("../components/ChatWindow.tsx"
 const chatInputSource = await jitiSource(new URL("../components/ChatInput.tsx", import.meta.url));
 const appShellSource = await jitiSource(new URL("../components/AppShell.tsx", import.meta.url));
 
+test("review HTTP acknowledgement recovers lost SSE closure without clearing a newer panel", async () => {
+  const { default: ts } = await import("typescript");
+  const callback = source.slice(
+    source.indexOf("  const sendExtensionCustomInput = useCallback"),
+    source.indexOf("  const addNotice = useCallback"),
+  );
+  const compiled = ts.transpileModule(`${callback}\nreturn sendExtensionCustomInput;`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const sid = { current: "review-session" };
+  const request = { id: "review-one", details: { kind: "grounding_review" } };
+  let panel = request;
+  let acknowledge;
+  const send = new Function("useCallback", "sessionIdRef", "sendAgentCommand", "setExtensionCustomUi", compiled)(
+    (fn) => fn, sid,
+    () => new Promise((resolve) => { acknowledge = resolve; }),
+    (update) => { panel = update(panel); },
+  );
+  const first = send(request, "confirmation");
+  acknowledge({ accepted: true, closed: true });
+  await first;
+  assert.equal(panel, null);
+
+  const second = send(request, "confirmation");
+  panel = { id: "review-two", details: request.details };
+  acknowledge({ accepted: false, closed: true });
+  await second;
+  assert.equal(panel.id, "review-two");
+
+  const invalid = send(panel, "invalid response");
+  acknowledge({ accepted: false, closed: false });
+  await assert.rejects(invalid, /审核未提交/);
+  assert.equal(panel.id, "review-two");
+
+  const late = send(panel, "confirmation");
+  sid.current = "another-session";
+  acknowledge({ accepted: true, closed: true });
+  await late;
+  assert.equal(panel.id, "review-two");
+});
+
 test("keeps the session event stream open through the idle grace window", () => {
   const finishSource = source.slice(
     source.indexOf("const finishPromptWithoutStream"),

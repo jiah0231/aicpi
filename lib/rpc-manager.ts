@@ -21,6 +21,7 @@ import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
 import type {
   ExtensionUiRequest,
+  GroundingReviewDetails,
   ExtensionUiResponse,
   ExtensionWidgetItem,
   SessionEntry,
@@ -43,6 +44,7 @@ import { isBuiltInSubagentsEnabled } from "./subagent-settings";
 import { resolveShellTools } from "./powershell-settings";
 import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./chat-only";
 import { createExactSystemPromptExtension } from "./exact-system-prompt";
+import { createGroundingSafetyExtension } from "./grounding-safety-extension";
 import {
   appendClearedSessionToolSelection,
   appendSessionToolSelection,
@@ -66,12 +68,12 @@ type PendingUiResponse = {
   resolve: (response: ExtensionUiResponse) => void;
   cancel: () => void;
 };
-
 type CustomUiComponent = {
   render: (width: number) => string[];
   handleInput?: (data: string) => void;
   dispose?: () => void;
   invalidate?: () => void;
+  groundingReview?: GroundingReviewDetails;
 };
 
 type ExtensionWidgetComponent = {
@@ -89,12 +91,12 @@ type ActiveExtensionWidget = {
   clearEmitted: boolean;
   rendered: boolean;
 };
-
 type ActiveCustomUi = {
   component: CustomUiComponent;
   width: number;
   resolve: (value: unknown) => void;
   settled: boolean;
+  groundingReview?: GroundingReviewDetails;
 };
 
 type ExtensionUiRequestBody = Record<string, unknown> & {
@@ -167,6 +169,7 @@ export interface RpcSessionStartOptions {
   thinkingLevel?: ThinkingLevel;
 }
 
+const GROUNDING_TOOL_NAMES = ["grounding_next_batch", "grounding_view", "grounding_save_result", "grounding_save_and_next"];
 const CODING_TOOL_NAMES = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"];
 const THINKING_LEVEL_NAMES = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
@@ -430,6 +433,19 @@ export class AgentSessionWrapper {
     }
   }
 
+  private async notifyExtensionsOfStop(): Promise<void> {
+    if (this.sessionShutdownEmitted) return;
+    this.sessionShutdownEmitted = true;
+    try {
+      await this.inner.extensionRunner.emit?.({ type: "session_shutdown", reason: "quit" });
+    } catch (error) {
+      console.error(
+        "[pi-web] session_shutdown before abort failed:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+
   setActiveToolSelection(toolNames: string[]): void {
     this.inner.setActiveToolsByName(withExtensionTools(this.inner, toolNames));
   }
@@ -665,7 +681,15 @@ export class AgentSessionWrapper {
         // Stop must unwind extension commands that have not started the agent yet.
         this.extensionUiAbortController.abort(new DOMException("Extension UI cancelled by Stop", "AbortError"));
         try {
-          await this.withFinalIdleReset(() => this.inner.abort());
+          await this.withFinalIdleReset(async () => {
+            await this.inner.abort();
+            // Keep the SDK abort as the first stop operation. This preserves the
+            // agent's normal cancellation ordering; shutdown() below still
+            // notifies extensions before disposal and the forced idle flag makes
+            // a stuck abort reap safely on the idle timer.
+            await this.notifyExtensionsOfStop();
+          });
+          await this.shutdown();
           return null;
         } finally {
           if (!this.isRunning()) this.forceShutdownOnIdle = false;
@@ -962,8 +986,7 @@ export class AgentSessionWrapper {
       }
 
       case "extension_ui_input": {
-        this.handleExtensionUiInput(command.id as string, command.data as string);
-        return null;
+        return this.handleExtensionUiInput(command.id as string, command.data as string);
       }
 
       case "set_auto_retry": {
@@ -1318,7 +1341,8 @@ export class AgentSessionWrapper {
       id,
       method: "custom",
       lines,
-    } as ExtensionUiRequest as AgentEvent;
+      ...(custom.groundingReview ? { details: custom.groundingReview } : {}),
+    };
     this.pendingUiRequests.set(id, event);
     this.emit(event);
   }
@@ -1344,12 +1368,17 @@ export class AgentSessionWrapper {
     custom.resolve(value);
   }
 
-  private handleExtensionUiInput(id: string, data: string): void {
+  private handleExtensionUiInput(id: string, data: string): { accepted: boolean; closed: boolean } {
     const custom = this.activeCustomUis.get(id);
-    if (!custom || typeof data !== "string") return;
+    if (!custom) return { accepted: false, closed: true };
+    if (typeof data !== "string") return { accepted: false, closed: false };
     try {
       custom.component.handleInput?.(data);
-      if (this.activeCustomUis.has(id)) this.emitCustomUiRender(id, custom);
+      const closed = !this.activeCustomUis.has(id);
+      if (!closed) this.emitCustomUiRender(id, custom);
+      // A review only accepts a complete, validated confirm/reject response,
+      // which synchronously closes its component. Other custom UIs take keys.
+      return { accepted: custom.groundingReview ? closed : true, closed };
     } catch (error) {
       this.closeCustomUi(id, undefined);
       this.emit({
@@ -1358,6 +1387,7 @@ export class AgentSessionWrapper {
         event: "custom_ui_input",
         error: error instanceof Error ? error.message : String(error),
       });
+      return { accepted: false, closed: true };
     }
   }
 
@@ -1414,11 +1444,13 @@ export class AgentSessionWrapper {
             finish(undefined as T);
             return;
           }
+          const typedComponent = component as CustomUiComponent;
           const custom: ActiveCustomUi = {
-            component: component as CustomUiComponent,
+            component: typedComponent,
             width,
             resolve: (value) => finish(value as T),
             settled: false,
+            ...(typedComponent.groundingReview ? { groundingReview: typedComponent.groundingReview } : {}),
           };
           this.activeCustomUis.set(id, custom);
           this.emitCustomUiRender(id, custom);
@@ -2057,6 +2089,10 @@ export async function startRpcSession(
                 cwd: sessionCwd,
                 settings: settingsManager,
               }),
+              createGroundingSafetyExtension({
+                cwd: sessionCwd,
+                sessionId,
+              }),
               createSubagentExtension(
                 SUBAGENT_CONTROLLER.extensionRuntime,
                 () => listSubagentProfiles(sessionCwd),
@@ -2107,6 +2143,14 @@ export async function startRpcSession(
       ...(toolsOption !== undefined ? { tools: toolsOption } : {}),
       ...(subagentResources ? { excludeTools: [...SUBAGENT_CONTROL_TOOL_NAMES] } : {}),
     });
+
+    if (!chatOnly && !subagentResources) {
+      const registeredTools = new Set(inner.getAllTools().map((tool) => tool.name));
+      const missingGroundingTools = GROUNDING_TOOL_NAMES.filter((name) => !registeredTools.has(name));
+      if (missingGroundingTools.length > 0) {
+        throw new Error(`Grounding extension failed to register required tools: ${missingGroundingTools.join(", ")}`);
+      }
+    }
 
     const persistedPreferences = await persistExplicitStartupPreferences(
       services.settingsManager,

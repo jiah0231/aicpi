@@ -275,7 +275,7 @@ export const CodeBlock = memo(function CodeBlock({ code, lang, headerAction, isS
     copyText(code).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    });
+    }).catch(() => {});
   };
 
   return (
