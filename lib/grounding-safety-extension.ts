@@ -1157,7 +1157,7 @@ async function loadGroundingImage(
   modality: GroundingModality,
   readImage: GroundingImageReader,
   currentBbox: readonly number[] | null,
-  includeOverlay = true,
+  decorations: "none" | "grid" | "hypothesis" | "all" = "hypothesis",
 ): Promise<GroundingImage> {
   const { bytes, label: path } = await readImage(sourcePath, record, modality);
   const metadata = await sharp(bytes).metadata();
@@ -1178,6 +1178,23 @@ async function loadGroundingImage(
   const originalHeight = resized?.originalHeight ?? metadata.height ?? magnified?.sourceHeight;
   const width = magnified?.width ?? resized?.width ?? metadata.width;
   const height = magnified?.height ?? resized?.height ?? metadata.height;
+  const showGrid = decorations === "grid" || decorations === "all";
+  const showHypothesis = decorations === "hypothesis" || decorations === "all";
+  let data = magnified?.data ?? resized?.data ?? displayBytes.toString("base64");
+  let displayMimeType = magnified?.mimeType ?? resized?.mimeType ?? mimeType;
+  let gridStep: { x: number; y: number } | null = null;
+  if (showGrid) {
+    if (!width || !height) throw new Error("Could not determine source image display dimensions for the grid.");
+    // Full views retain their existing resize/orientation policy; only decorate
+    // the display, anchoring labels to the same raw source axes as crop grids.
+    const vertical = cropGridAxis(0, 1, width);
+    const horizontal = cropGridAxis(0, 1, height);
+    data = (await sharp(Buffer.from(data, "base64"))
+      .composite([{ input: cropGridOverlay(vertical, horizontal, width, height), top: 0, left: 0 }])
+      .png().toBuffer()).toString("base64");
+    displayMimeType = "image/png";
+    gridStep = { x: vertical.step, y: horizontal.step };
+  }
   const details = {
     modality,
     path,
@@ -1200,18 +1217,20 @@ async function loadGroundingImage(
             ? { magnification: magnified.zoom, displayedSizePixels: [magnified.width, magnified.height] }
             : {}),
           currentBbox: normalizedCurrentBbox,
-          overlay: !includeOverlay ? "none" : normalizedCurrentBbox ? "current_hypothesis" : "current_hypothesis_none",
+          decorations,
+          gridStep,
+          overlay: !showHypothesis ? "none" : normalizedCurrentBbox ? "current_hypothesis" : "current_hypothesis_none",
         }),
       },
       {
         type: "image",
-        data: magnified?.data ?? resized?.data ?? displayBytes.toString("base64"),
-        mimeType: magnified?.mimeType ?? resized?.mimeType ?? mimeType,
+        data,
+        mimeType: displayMimeType,
       },
     ],
     details,
   };
-  if (!includeOverlay) return encodeGroundingImagePayload(image);
+  if (!showHypothesis) return encodeGroundingImagePayload(image);
   return withGroundingOverlay(
     image,
     normalizedCurrentBbox,
@@ -2165,7 +2184,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         const candidateCount = order?.possibleCount ?? contract?.candidates.filter((item) => item.identity.status !== "contradicted").length ?? 0;
         // The browser draws the editable box. Baked-in hypothesis pixels would
         // leave a second, stale box visible after a manual edit.
-        const visibleImage = await loadGroundingImage(sourcePath, loaded.record, "visible", readRecordImage, null, false);
+        const visibleImage = await loadGroundingImage(sourcePath, loaded.record, "visible", readRecordImage, null, "none");
         const boundaryRegion = verificationRegionFor(rawBbox);
         const boundaryCrop = boundaryRegion
           ? await loadGroundingCrop(sourcePath, loaded.record, "visible", boundaryRegion, null, readRecordImage, undefined, "none")
@@ -2435,7 +2454,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         const contract = params.contract === undefined ? loaded.workingState?.contract
           : validateGroundingConstraintContract(params.contract, loaded.record.query ?? "");
         const constraintAssessment = assessOriginalQueryConstraints(contract, loaded.record.query ?? "", bbox);
-        const visible = await loadGroundingImage(loaded.sourcePath, loaded.record, "visible", readRecordImage, null, false);
+        const visible = await loadGroundingImage(loaded.sourcePath, loaded.record, "visible", readRecordImage, null, "none");
         const overlay = await renderGroundingOverlay(visible, bbox, `${key} | UNSAVED PROPOSAL`);
         const proposal: GroundingImage = {
           content: [{ type: "text", text: JSON.stringify({ key, modality: "visible", role: "unsaved_proposal", bbox }) },
@@ -2964,7 +2983,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           });
           // One explicitly labelled overview, never projected annotations from another sensor.
           const overviewModality = regions[0].modality;
-          const overview = await loadGroundingImage(loaded.sourcePath, loaded.record, overviewModality, readRecordImage, null, false);
+          const overview = await loadGroundingImage(loaded.sourcePath, loaded.record, overviewModality, readRecordImage, null, "none");
           const crops = await Promise.all(regions.map((item) => loadGroundingCrop(loaded.sourcePath, loaded.record, item.modality, item.region, null, readRecordImage, 1, "none")));
           const bytes = (image: GroundingImage) => {
             const block = image.content.find((item) => item.type === "image");
@@ -3137,7 +3156,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             const zoom = params.zoom ?? (recalled && !regionInput
               ? Math.max(1, ((recalled.displayRect?.[2] ?? recalled.width) - (recalled.displayRect?.[0] ?? 0)) / (recalled.sourceWidth * (recalled.region[2] - recalled.region[0])))
               : undefined);
-            const overview = loaded.overviewViewIds.has(modality) ? undefined : await loadGroundingImage(sourcePath, loaded.record, modality, readRecordImage, null, false);
+            const overview = loaded.overviewViewIds.has(modality) ? undefined : await loadGroundingImage(sourcePath, loaded.record, modality, readRecordImage, null, "none");
             const region = validateBoundingBox(requestedRegion);
             if (selected && !boxesIntersect(selected, region)) {
               throw new Error(
@@ -3182,8 +3201,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             };
           }
 
-          const image = await loadGroundingImage(sourcePath, loaded.record, modality, readRecordImage, currentBbox,
-            decorations === "all" || decorations === "hypothesis");
+          const image = await loadGroundingImage(sourcePath, loaded.record, modality, readRecordImage, currentBbox, decorations);
           const view = registerGroundingView(loaded, image, decorations);
           const newModality = !loaded.overviewViewIds.has(modality);
           grantRecordModality(loaded, modality);
