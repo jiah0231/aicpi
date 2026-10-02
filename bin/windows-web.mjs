@@ -20,8 +20,8 @@ function readState() {
     throw new Error("No manager found. First run .\\start-web.cmd in an EXTERNAL Windows terminal.");
   }
   const [runId, phase, heartbeat, generation, port, mode] = lines;
-  if (lines.length !== 6 || !/^[a-f0-9]{32}$/.test(runId) ||
-      !["starting", "ready", "restarting", "failed", "stopped"].includes(phase) ||
+  if ((lines.length !== 6 && lines.length !== 7) || !/^[a-f0-9]{32}$/.test(runId) ||
+      !["starting", "ready", "restarting", "updating", "failed", "stopped"].includes(phase) ||
       !/^\d+$/.test(heartbeat) || !/^\d+$/.test(generation) || !/^\d+$/.test(port) ||
       !["dev", "start"].includes(mode)) {
     throw new Error("Invalid manager state. Check the external launcher window.");

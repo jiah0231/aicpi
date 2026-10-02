@@ -5,6 +5,13 @@ export const zhCNLocale: LocalePlugin = {
   id: "zh-CN",
   label: "简体中文",
   messages: {
+    "groundingReview.modelReason": "模型提议理由（可编辑）",
+    "groundingReview.unresolvedPreviewNote": "预览仅显示候选框，不代表缺失的身份、排序或姿态证据已经核实；看不见的部位不能证明所要求的姿态。审核时请保留仍无依据的未解决项。",
+    "chat.commandUpdate": "拉取最新 gptdot 并重启 Web",
+    "chat.updateConfirm": "拉取最新 origin/gptdot 并重启 Web？重启会中断所有正在运行的任务、待审核内容和内置终端。请先保存工作。本地修改和未跟踪文件会保留；如果有冲突，更新会停止。",
+    "chat.updateCancelled": "已取消更新",
+    "chat.updateRequested": "已提交更新请求。请查看外部启动窗口，只有显示 READY 才表示重启成功；失败详情见 .pi-web-run/update.log。显示 READY 后刷新网页。",
+    "chat.updateUsage": "用法：/update（不带参数）",
     "groundingLearning.disabledTarget": "此规则已停用。保存审核版本后仍保持停用；需要启用时请另行点击恢复。",
     "groundingLearning.saveReviewed": "保存已审核版本",
     "groundingLearning.category.identity": "身份",

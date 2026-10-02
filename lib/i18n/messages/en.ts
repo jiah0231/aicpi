@@ -5,6 +5,13 @@ export const enLocale: LocalePlugin = {
   id: "en",
   label: "English",
   messages: {
+    "groundingReview.modelReason": "Model proposal reason (editable)",
+    "groundingReview.unresolvedPreviewNote": "The preview only displays a proposed box. It does not verify missing identity, rank, or pose evidence; invisible parts cannot establish a required pose. Keep unsupported conditions unresolved when reviewing.",
+    "chat.commandUpdate": "Pull gptdot and restart Web",
+    "chat.updateConfirm": "Pull the latest origin/gptdot and restart Web? Restart interrupts ALL active tasks, pending reviews and embedded terminals. Save your work first. Local edits and untracked files are preserved; conflicting changes stop the update.",
+    "chat.updateCancelled": "Update cancelled",
+    "chat.updateRequested": "Update requested. Check the external launcher: only READY confirms restart succeeded. On failure, see .pi-web-run/update.log. Refresh this page after READY.",
+    "chat.updateUsage": "Usage: /update (no arguments)",
     "groundingLearning.disabledTarget": "This rule is disabled. Saving the reviewed revision keeps it disabled; use Restore separately to enable it.",
     "groundingLearning.saveReviewed": "Save reviewed version",
     "groundingLearning.category.identity": "Identity",

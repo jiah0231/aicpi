@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
@@ -43,6 +44,7 @@ namespace PiWeb
                 // variables, including password/allowed hosts/proxies, survive.
                 Environment.SetEnvironmentVariable("PI_WEB_HOSTNAME", "127.0.0.1");
                 Job job = null;
+                Process updater = null;
                 bool launch = true;
                 DateTime deadline = DateTime.UtcNow;
                 phase = "starting";
@@ -51,7 +53,56 @@ namespace PiWeb
                     while (!parentClosed)
                     {
                         if (Consume("stop")) break;
-                        if (Consume("restart"))
+                        bool restart = Consume("restart");
+                        bool update = ConsumeUpdate();
+                        if (updater != null)
+                        {
+                            // Requests during an update are coalesced, never parallelized.
+                            restart = false;
+                            if (updater.HasExited)
+                            {
+                                updater.WaitForExit(); // Drain redirected output before disposing.
+                                bool ok = updater.ExitCode == 0;
+                                updater.Dispose(); updater = null;
+                                ConsumeUpdate();
+                                UpdateResult(ok ? "pulled" : "failed");
+                                if (ok) { restart = true; Log("Update finished; requesting restart."); }
+                                else { phase = "starting"; deadline = DateTime.UtcNow.AddSeconds(120); ClearUpdateLock(); Log("UPDATE FAILED: server was not restarted. See update.log; local files were not reset or cleaned."); }
+                            }
+                        }
+                        else if (update)
+                        {
+                            restart = false;
+                            if (mode != "dev") Log("UPDATE FAILED: source updates require dev mode; no build was run.");
+                            else
+                            {
+                                try
+                                {
+                                    phase = "updating"; State();
+                                    UpdateResult("updating");
+                                    ProcessStartInfo info = new ProcessStartInfo(node, Quote(Path.Combine(root, "bin", "web-source-update.mjs")));
+                                    info.WorkingDirectory = root;
+                                    info.UseShellExecute = false;
+                                    info.CreateNoWindow = true;
+                                    info.RedirectStandardOutput = true;
+                                    info.RedirectStandardError = true;
+                                    updater = new Process(); updater.StartInfo = info;
+                                    updater.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) { UpdateLog(e.Data); };
+                                    updater.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e) { UpdateLog(e.Data); };
+                                    updater.Start(); updater.BeginOutputReadLine(); updater.BeginErrorReadLine();
+                                    Log("UPDATE: pulling origin/gptdot; restart only after success.");
+                                }
+                                catch (Exception error)
+                                {
+                                    if (updater != null) { updater.Dispose(); updater = null; }
+                                    phase = "starting"; deadline = DateTime.UtcNow.AddSeconds(120);
+                                    UpdateResult("failed");
+                                    ClearUpdateLock();
+                                    Log("UPDATE FAILED: " + error.Message);
+                                }
+                            }
+                        }
+                        if (restart)
                         {
                             phase = "restarting";
                             State();
@@ -121,7 +172,7 @@ namespace PiWeb
                 }
                 finally
                 {
-                    try { if (job != null) { try { job.Stop(); } finally { job.Dispose(); } } }
+                    try { if (updater != null) { updater.WaitForExit(); updater.Dispose(); } if (job != null) { try { job.Stop(); } finally { job.Dispose(); } } }
                     finally { phase = "stopped"; State(); Log("STOPPED"); }
                 }
             }
@@ -132,9 +183,27 @@ namespace PiWeb
             long now = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
             string temporary = Path.Combine(directory, "state.tmp");
             string target = Path.Combine(directory, "state");
-            File.WriteAllText(temporary, runId + "\n" + phase + "\n" + now + "\n" + generation + "\n" + port + "\n" + mode + "\n", Utf8);
+            File.WriteAllText(temporary, runId + "\n" + phase + "\n" + now + "\n" + generation + "\n" + port + "\n" + mode + "\nupdate-v1\n", Utf8);
             if (File.Exists(target)) File.Replace(temporary, target, null);
             else File.Move(temporary, target);
+        }
+
+        private static void UpdateResult(string result)
+        {
+            File.WriteAllText(Path.Combine(directory, "update-result"), runId + "\n" + generation + "\n" + result, Utf8);
+        }
+
+        private static void ClearUpdateLock()
+        {
+            string file = Path.Combine(directory, "update-" + runId + "-" + generation + ".lock");
+            if (File.Exists(file)) File.Delete(file);
+        }
+
+        private static readonly object UpdateLogLock = new object();
+        private static void UpdateLog(string message)
+        {
+            if (message == null) return;
+            lock (UpdateLogLock) File.AppendAllText(Path.Combine(directory, "update.log"), message + Environment.NewLine, Utf8);
         }
 
         private static void Log(string message)
@@ -142,6 +211,20 @@ namespace PiWeb
             string line = DateTime.UtcNow.ToString("o") + " " + message;
             Console.WriteLine(line);
             File.AppendAllText(Path.Combine(directory, "manager.log"), line + Environment.NewLine, Utf8);
+        }
+
+        private static bool ConsumeUpdate()
+        {
+            // Stale requests can be published after the API read an earlier
+            // generation. Discard them; they must never update a later server.
+            string expected = Path.Combine(directory, "update-" + runId + "-" + generation + ".request");
+            bool current = false;
+            foreach (string request in Directory.GetFiles(directory, "update-" + runId + "-*.request"))
+            {
+                if (String.Equals(request, expected, StringComparison.OrdinalIgnoreCase) && phase == "ready") current = true;
+                File.Delete(request);
+            }
+            return current;
         }
 
         private static bool Consume(string action)
