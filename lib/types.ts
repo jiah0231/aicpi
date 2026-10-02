@@ -142,6 +142,21 @@ export interface GroundingReviewImage {
   height?: number;
 }
 export type GroundingReviewStatus = "ok" | "low_confidence" | "unresolved";
+export type GroundingLearningCategory =
+  | "identity"
+  | "boundary"
+  | "order"
+  | "relation"
+  | "cross_modal"
+  | "uncertainty"
+  | "efficiency"
+  | "other";
+export type GroundingLearningScope = "similar" | "global";
+export interface GroundingReviewLearning {
+  category: GroundingLearningCategory;
+  scope: GroundingLearningScope;
+  advice: string;
+}
 export interface GroundingCandidateChange {
   previousBbox: [number, number, number, number];
   iou: number;
@@ -186,11 +201,13 @@ export type GroundingReviewResponse =
       candidateRank?: number;
       constraintsResolved?: boolean;
       reason: string;
+      learning?: GroundingReviewLearning;
     }
   | {
       type: "grounding_review_response";
       action: "reject";
       reason: string;
+      learning?: GroundingReviewLearning;
     };
 export type ExtensionUiRequest =
   | {

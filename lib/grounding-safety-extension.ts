@@ -28,6 +28,12 @@ import {
   hasGroundingRequestDiagnosticsMarker,
   stripGroundingRequestDiagnosticsMarker,
 } from "./grounding-request-diagnostics";
+import {
+  appendGroundingLesson,
+  groundingLessonsForModel,
+  selectGroundingLessons,
+  validateGroundingReviewLearning,
+} from "./grounding-learning";
 
 const EXTENSION_NAME = "pi-web-grounding-safety";
 const GROUNDING_SECTION = "grounding_runtime_safety";
@@ -99,6 +105,7 @@ type GroundingSafetyOptions = {
   cwd: string;
   sessionId: string;
   imageArchives?: Partial<Record<GroundingModality, string>>;
+  learningPath?: string;
 };
 
 type SanitizedQueryState = {
@@ -788,6 +795,7 @@ export function validateGroundingReviewResponse(
     throw new Error("Browser grounding review returned no structured response.");
   }
   const input = value as Record<string, unknown>;
+  const learning = validateGroundingReviewLearning(input.learning);
   if (input.type !== "grounding_review_response") {
     throw new Error("Browser grounding review returned an unexpected response type.");
   }
@@ -795,7 +803,12 @@ export function validateGroundingReviewResponse(
     if (typeof input.reason !== "string" || input.reason.trim().length < 1) {
       throw new Error("A browser review rejection must include a reason.");
     }
-    return { type: "grounding_review_response", action: "reject", reason: input.reason.trim() };
+    return {
+      type: "grounding_review_response",
+      action: "reject",
+      reason: input.reason.trim(),
+      ...(learning ? { learning } : {}),
+    };
   }
   if (input.action !== "confirm") throw new Error("Browser grounding review must confirm or reject the candidate.");
   if (!Array.isArray(input.bbox) || input.bbox.some((coordinate) => typeof coordinate !== "number")) {
@@ -845,6 +858,7 @@ export function validateGroundingReviewResponse(
     ...(targetFound && candidateRank !== undefined ? { candidateRank: candidateRank as number } : {}),
     ...(input.constraintsResolved === true ? { constraintsResolved: true } : {}),
     reason: input.reason.trim(),
+    ...(learning ? { learning } : {}),
   };
   return confirmed;
 }
@@ -1902,6 +1916,19 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         const imageDetails: GroundingImage["details"][] = [];
         if (current) {
           try {
+            const lessons = await selectGroundingLessons(
+              current[1].record.query ?? "",
+              payload.includedModalities,
+              { filePath: options.learningPath },
+            );
+            if (lessons.length > 0) {
+              content.push({ type: "text", text: JSON.stringify({ groundingReviewLessons: groundingLessonsForModel(lessons) }) });
+            }
+          } catch {
+            // Learning is advisory. A missing, unreadable, or manually edited
+            // lesson store must never block the current annotation record.
+          }
+          try {
             for (const modality of payload.includedModalities) {
               const image = await loadGroundingImage(sourcePath, current[1].record, modality, readRecordImage,
                 current[1].currentBbox ?? null);
@@ -2061,9 +2088,29 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           reviewInterrupted = true;
           throw error;
         }
+        let learningSaved = false;
+        let learningWarning: string | undefined;
+        if (review.learning) {
+          try {
+            await appendGroundingLesson({
+              outcome: review.action === "confirm" ? "confirmed" : "rejected",
+              query: loaded.record.query ?? "",
+              modalities: Array.from(loaded.grantedModalities),
+              learning: review.learning,
+            }, options.learningPath);
+            learningSaved = true;
+          } catch (error) {
+            learningWarning = `The review was accepted, but its long-term lesson could not be saved: ${(error as Error).message}`;
+          }
+        }
         if (review.action === "reject") {
           reviewInterrupted = true;
-          throw new Error(`Browser grounding review rejected candidate: ${review.reason}. Revise this same record and request review again; do not load the next record.`);
+          throw new Error(
+            `Browser grounding review rejected candidate: ${review.reason}. `
+            + `${review.learning ? `Human improvement guidance: ${review.learning.advice}. ` : ""}`
+            + "Revise this same record and request review again; do not load the next record."
+            + (learningWarning ? ` ${learningWarning}` : ""),
+          );
         }
         signal?.throwIfAborted();
         // A later, explicitly approved correction clears the rejection barrier;
@@ -2163,7 +2210,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         batchExhausted = summary.processed === summary.total
           || requestedRecordLimit !== undefined && sessionSavedCount >= requestedRecordLimit;
         persistJob();
-        return { summary, overlay, verificationContent, revision };
+        return { summary, overlay, verificationContent, revision, learningSaved, learningWarning };
       };
 
       const saveGroundingResult = async (
@@ -2755,10 +2802,11 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         }),
         executionMode: "sequential",
         async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-          const { summary, overlay, verificationContent, revision } = await saveGroundingResult(params, ctx, signal);
+          const { summary, overlay, verificationContent, revision, learningSaved, learningWarning } = await saveGroundingResult(params, ctx, signal);
           const requestedLimitReached = requestedRecordLimit !== undefined && sessionSavedCount >= requestedRecordLimit;
           const shouldContinue = !revision && !requestedLimitReached && requestedRecordLimit !== undefined && summary.processed < summary.total;
-          const result = { ...summary, job: jobSnapshot(), nextAction: shouldContinue ? "grounding_next_batch" : "complete" };
+          const result = { ...summary, job: jobSnapshot(), nextAction: shouldContinue ? "grounding_next_batch" : "complete",
+            ...(learningSaved ? { learningSaved: true } : {}), ...(learningWarning ? { learningWarning } : {}) };
           if (!revision && (summary.processed === summary.total || requestedLimitReached)) reportCompletion(summary.processed, summary.total, params.outputDir);
           if (revision) pi.sendMessage({ customType: "grounding-revised", content: `【返修完成】${params.key} 的新框已经人工确认并保存。`, display: true }, { triggerTurn: false });
           return {
@@ -2800,7 +2848,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         }),
         executionMode: "sequential",
         async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-          const { summary: saved, overlay, verificationContent, revision } = await saveGroundingResult(params, ctx, signal, true);
+          const { summary: saved, overlay, verificationContent, revision, learningSaved, learningWarning } = await saveGroundingResult(params, ctx, signal, true);
           signal?.throwIfAborted();
           const overlayBlock = { type: "image" as const, data: overlay.data, mimeType: overlay.mimeType };
           if (revision || (requestedRecordLimit !== undefined && sessionSavedCount >= requestedRecordLimit)) {
@@ -2809,12 +2857,14 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
               content: [
                 {
                   type: "text" as const,
-                  text: JSON.stringify({ saved, next: null, revision, requestedLimitReached: !revision }),
+                  text: JSON.stringify({ saved, next: null, revision, requestedLimitReached: !revision,
+                    ...(learningSaved ? { learningSaved: true } : {}), ...(learningWarning ? { learningWarning } : {}) }),
                 },
                 overlayBlock,
                 ...verificationContent,
               ],
-              details: { saved, next: null, revision, requestedLimitReached: !revision, job: jobSnapshot() },
+              details: { saved, next: null, revision, requestedLimitReached: !revision, job: jobSnapshot(),
+                ...(learningSaved ? { learningSaved: true } : {}), ...(learningWarning ? { learningWarning } : {}) },
               terminate: true,
             };
           }
@@ -2823,12 +2873,14 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           if (!key) reportCompletion(next.payload.completed, next.payload.total, next.payload.outputDir);
           return {
             content: [
-              { type: "text" as const, text: JSON.stringify({ saved, next: next.payload }) },
+              { type: "text" as const, text: JSON.stringify({ saved, next: next.payload,
+                ...(learningSaved ? { learningSaved: true } : {}), ...(learningWarning ? { learningWarning } : {}) }) },
               overlayBlock,
               ...verificationContent,
               ...next.content.slice(1),
             ],
-            details: { saved, next: next.details },
+            details: { saved, next: next.details,
+              ...(learningSaved ? { learningSaved: true } : {}), ...(learningWarning ? { learningWarning } : {}) },
             terminate: !key,
           };
         },

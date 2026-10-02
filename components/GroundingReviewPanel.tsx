@@ -2,7 +2,12 @@
 /* eslint-disable @next/next/no-img-element -- review images are data URLs produced by the grounding runtime. */
 
 import { useMemo, useRef, useState } from "react";
-import type { ExtensionUiRequest, GroundingReviewDetails } from "@/lib/types";
+import type {
+  ExtensionUiRequest,
+  GroundingLearningCategory,
+  GroundingLearningScope,
+  GroundingReviewDetails,
+} from "@/lib/types";
 
 export type GroundingReviewRequest = Extract<ExtensionUiRequest, { method: "custom" }> & {
   details: GroundingReviewDetails;
@@ -42,6 +47,10 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
   const [constraintsResolved, setConstraintsResolved] = useState(false);
   const unresolvedChecks = details.constraintAssessment !== undefined && !details.constraintAssessment.canLock;
   const [rejectionReason, setRejectionReason] = useState("");
+  const [learningAdvice, setLearningAdvice] = useState("");
+  const [learningCategory, setLearningCategory] = useState<GroundingLearningCategory>("other");
+  const [learningScope, setLearningScope] = useState<GroundingLearningScope>("similar");
+  const [rememberLearning, setRememberLearning] = useState(true);
   const [submission, setSubmission] = useState<"confirm" | "reject" | "submitted" | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   // State alone does not guard two clicks delivered before React re-renders.
@@ -51,6 +60,7 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
   const imageUrl = `data:${details.image.mimeType};base64,${details.image.data}`;
   const imageReady = loadedImage === imageUrl && failedImage !== imageUrl;
   const busy = submission !== null;
+  const learningInvalid = rememberLearning && learningAdvice.trim().length > 0 && learningAdvice.trim().length < 8;
 
   const width = details.image.originalWidth || details.image.width || 1;
   const height = details.image.originalHeight || details.image.height || 1;
@@ -74,8 +84,16 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
     if (unresolvedChecks && (status !== "unresolved" || confidence > 0.49) && !constraintsResolved) {
       messages.push("Keep unresolved checks at status unresolved and confidence ≤ 0.49, or explicitly confirm you resolved them below.");
     }
+    if (learningInvalid) {
+      messages.push("长期改进建议至少需要 8 个字符，或留空不保存。");
+    }
     return messages;
-  }, [bbox, candidateCount, candidateRank, confidence, details.expectedOrdinal, reason, status, targetFound, unresolvedChecks, constraintsResolved]);
+  }, [bbox, candidateCount, candidateRank, confidence, details.expectedOrdinal, reason, status, targetFound, unresolvedChecks,
+    constraintsResolved, learningInvalid]);
+
+  const learningPayload = () => rememberLearning && learningAdvice.trim().length > 0
+    ? { learning: { category: learningCategory, scope: learningScope, advice: learningAdvice.trim() } }
+    : {};
 
   const send = async (action: "confirm" | "reject", payload: Record<string, unknown>) => {
     if (submissionLocked.current) return;
@@ -104,12 +122,14 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
       ...(candidateRank === undefined ? {} : { candidateRank }),
       ...(constraintsResolved ? { constraintsResolved: true } : {}),
       reason: reason.trim(),
+      ...learningPayload(),
     });
   };
 
   const reject = () => {
     void send("reject", {
       reason: rejectionReason.trim() || "The browser review rejected this candidate.",
+      ...learningPayload(),
     });
   };
 
@@ -311,6 +331,45 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
               <textarea aria-label="Evidence reason" value={reason} onChange={(event) => setReason(event.target.value)} rows={3} style={{ resize: "vertical", padding: "7px 8px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg-panel)", color: "var(--text)", fontSize: 12, lineHeight: 1.4 }} />
             </label>
 
+            <div style={{ display: "grid", gap: 8, padding: "9px 10px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg-panel)" }}>
+              <div style={{ fontSize: 12, fontWeight: 650 }}>长期改进建议</div>
+              <textarea
+                aria-label="Long-term grounding improvement advice"
+                value={learningAdvice}
+                onChange={(event) => setLearningAdvice(event.target.value)}
+                rows={3}
+                maxLength={1200}
+                placeholder="例如：锁定小目标后仍要检查完整外轮廓，不能只框内部高对比区域。"
+                style={{ resize: "vertical", padding: "7px 8px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg)", color: "var(--text)", fontSize: 12, lineHeight: 1.4 }}
+              />
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                <label style={{ display: "grid", gap: 4, color: "var(--text-muted)", fontSize: 11 }}>
+                  问题类别
+                  <select aria-label="Learning category" value={learningCategory} onChange={(event) => setLearningCategory(event.target.value as GroundingLearningCategory)} style={{ padding: "6px 7px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg)", color: "var(--text)", fontSize: 12 }}>
+                    <option value="identity">目标身份</option>
+                    <option value="boundary">边界完整性</option>
+                    <option value="order">顺序 / 排名</option>
+                    <option value="relation">所属 / 空间关系</option>
+                    <option value="cross_modal">跨模态对应</option>
+                    <option value="uncertainty">不确定性处理</option>
+                    <option value="efficiency">效率 / 工具使用</option>
+                    <option value="other">其他</option>
+                  </select>
+                </label>
+                <label style={{ display: "grid", gap: 4, color: "var(--text-muted)", fontSize: 11 }}>
+                  适用范围
+                  <select aria-label="Learning scope" value={learningScope} onChange={(event) => setLearningScope(event.target.value as GroundingLearningScope)} style={{ padding: "6px 7px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg)", color: "var(--text)", fontSize: 12 }}>
+                    <option value="similar">仅相似题目</option>
+                    <option value="global">所有定位任务</option>
+                  </select>
+                </label>
+              </div>
+              <label style={{ display: "flex", gap: 7, alignItems: "flex-start", color: "var(--text-muted)", fontSize: 11, lineHeight: 1.4 }}>
+                <input type="checkbox" checked={rememberLearning} onChange={(event) => setRememberLearning(event.target.checked)} />
+                跨会话保存。后续任务只把它作为人工经验，不覆盖当前题目、图像证据或安全规则。
+              </label>
+            </div>
+
             {validationMessages.length > 0 && (
               <div role="alert" style={{ display: "grid", gap: 4, padding: "8px 9px", border: "1px solid rgba(245,158,11,0.45)", borderRadius: 5, background: "rgba(245,158,11,0.10)", color: "var(--text-muted)", fontSize: 11, lineHeight: 1.4 }}>
                 {validationMessages.map((message) => <div key={message}>• {message}</div>)}
@@ -328,7 +387,7 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
           {submitError && <div role="alert" style={{ marginBottom: 8, color: "var(--text)", fontSize: 12, lineHeight: 1.5, overflowWrap: "anywhere" }}>提交失败：{submitError}</div>}
           <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "flex-end", gap: 8 }}>
             {busy && <span role="status" style={{ marginRight: "auto", color: "var(--text-muted)", fontSize: 12 }}>{submission === "submitted" ? "已提交，等待处理…" : "正在提交…"}</span>}
-            <button type="button" disabled={busy} onClick={reject} style={{ minHeight: 40, padding: "7px 11px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg)", color: "var(--text-muted)", cursor: busy ? "not-allowed" : "pointer", fontSize: 12 }}>退回修改</button>
+            <button type="button" disabled={busy || learningInvalid} onClick={reject} style={{ minHeight: 40, padding: "7px 11px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg)", color: "var(--text-muted)", cursor: busy || learningInvalid ? "not-allowed" : "pointer", fontSize: 12 }}>退回修改</button>
             <button type="button" disabled={approvalDisabled} onClick={confirm} style={{ minHeight: 40, padding: "7px 12px", border: "1px solid var(--accent)", borderRadius: 6, background: approvalDisabled ? "var(--bg-hover)" : "var(--accent)", color: approvalDisabled ? "var(--text-dim)" : "var(--accent-contrast)", cursor: approvalDisabled ? "not-allowed" : "pointer", fontSize: 12, fontWeight: 650 }}>{details.canContinue === false ? "通过并完成" : "通过 / 下一张"}</button>
           </div>
         </div>
