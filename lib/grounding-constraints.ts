@@ -211,7 +211,16 @@ export function validateGroundingConstraintContract(input: unknown, originalQuer
       const path = `${field}.requirements[${index}]`;
       const requirement = object(input, path, ["id", "queryText", "description", "status", "evidence"]);
       const queryText = text(requirement.queryText, `${path}.queryText`, GROUNDING_CONSTRAINT_LIMITS.queryExcerptCharacters, true, !query.trim());
-      if (!query.includes(queryText)) throw new Error(`Grounding contract ${path}.queryText must be an exact excerpt of originalQuery.`);
+      if (!query.includes(queryText)) {
+        // Suggest the source's exact spelling without rewriting the model's
+        // contract or asking it to inspect the same image again.
+        const escaped = queryText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const sourceMatch = new RegExp(escaped, "iu").exec(query)?.[0];
+        const repair = sourceMatch === undefined
+          ? "Copy a contiguous, case-sensitive excerpt from originalQuery."
+          : `Replace only this queryText with ${JSON.stringify(sourceMatch)}; capitalization must match the source.`;
+        throw new Error(`Grounding contract ${path}.queryText must be an exact excerpt of originalQuery. ${repair} Keep the current observations and proposal; no new image call is needed for this field repair.`);
+      }
       return {
         id: identifier(requirement.id, `${path}.id`),
         queryText,
@@ -363,7 +372,7 @@ export function assessGroundingConstraints(
     inspectSupport(order.candidateSet, "candidate_set_unresolved", `Candidate membership/completeness for reading ${interpretation.id}`);
     if (order.selectedCandidateId !== contract.selectedCandidateId) issue("selected_candidate_mismatch", `Reading ${interpretation.id} selects ${order.selectedCandidateId}, but the contract selects ${contract.selectedCandidateId ?? "none"}.`, true);
     if (!assessment.orderedCandidateIds.includes(order.selectedCandidateId)) issue("selected_candidate_not_in_order", `Selected candidate ${order.selectedCandidateId} is absent from the viable ordering set.`, true);
-    if (assessment.possibleCount < order.ordinal) issue("insufficient_candidates", `Reading ${interpretation.id} requests rank ${order.ordinal}, but only ${assessment.possibleCount} possible candidates (${assessment.supportedCount} supported) are declared.`);
+    if (assessment.possibleCount < order.ordinal) issue("insufficient_candidates", `Reading ${interpretation.id} requests rank ${order.ordinal}, but only ${assessment.possibleCount} possible candidates (${assessment.supportedCount} supported) are declared. Do not relabel the last visible candidate as the missing rank or invent hidden members. Inspect further only for a specific observed ambiguity; otherwise submit unresolved for human review, or use grounding_evidence clarification to ask about the missing referent without proposing a box.`);
     if (assessment.supportedCount !== order.candidateIds.length) issue("ordering_identity_unresolved", `Reading ${interpretation.id} has unresolved, contradicted or measurement-only candidate identities; they cannot establish the requested count/order.`);
     if (assessment.tiedCandidateIds.length > 0) issue("spatial_tie", `Selected candidate ${order.selectedCandidateId} has indistinguishable ${order.axis}-centers with ${assessment.tiedCandidateIds.join(", ")}; no unique requested rank is established.`);
     if (assessment.selectedRank !== undefined && assessment.selectedRank !== order.ordinal) {

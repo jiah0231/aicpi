@@ -157,11 +157,14 @@ export type GroundingLearningCategory =
   | "uncertainty"
   | "efficiency"
   | "other";
-export type GroundingLearningScope = "similar" | "global";
 export interface GroundingReviewLearning {
   category: GroundingLearningCategory;
-  scope: GroundingLearningScope;
-  advice: string;
+  applicability: string;
+  error: string;
+  method: string;
+  check: string;
+  /** Explicit human attestation, not a claim of automatic semantic validation. */
+  sampleIndependent: true;
 }
 export interface GroundingCandidateChange {
   previousBbox: [number, number, number, number];

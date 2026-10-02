@@ -2,11 +2,12 @@
 /* eslint-disable @next/next/no-img-element -- review images are data URLs produced by the grounding runtime. */
 
 import { useMemo, useRef, useState } from "react";
+import { validateGroundingReviewLearning } from "@/lib/grounding-learning-validation";
 import type {
   ExtensionUiRequest,
   GroundingLearningCategory,
-  GroundingLearningScope,
   GroundingReviewDetails,
+  GroundingReviewLearning,
 } from "@/lib/types";
 
 export type GroundingReviewRequest = Extract<ExtensionUiRequest, { method: "custom" }> & {
@@ -50,6 +51,39 @@ export function mapBboxToBoundaryPreview(bbox: Bbox, region: Bbox) {
   };
 }
 
+type GroundingLearningDraft = Omit<GroundingReviewLearning, "sampleIndependent"> & {
+  sampleIndependent: boolean;
+};
+
+export function prepareGroundingReviewLearning(
+  remember: boolean,
+  draft: GroundingLearningDraft,
+): { learning?: GroundingReviewLearning; error?: string } {
+  if (!remember) return {};
+  const applicability = draft.applicability.trim();
+  const error = draft.error.trim();
+  const method = draft.method.trim();
+  const check = draft.check.trim();
+  if (![applicability, error, method, check].some(Boolean)) return {};
+
+  if (applicability.length < 4 || applicability.length > 240
+    || error.length < 4 || error.length > 400
+    || method.length < 8 || method.length > 800
+    || check.length < 4 || check.length > 400) {
+    return { error: "请补全通用经验：适用条件 4–240 字符、常见错误 4–400 字符、改进方法 8–800 字符、复查步骤 4–400 字符；或关闭跨会话保存后继续审核。" };
+  }
+  if (draft.sampleIndependent !== true) {
+    return { error: "请人工确认新写的经验与具体样本无关；或关闭跨会话保存后继续审核。" };
+  }
+  // Length checks and lexical validation cannot establish semantic independence.
+  // The author must review the newly written procedure and explicitly attest it.
+  try {
+    return { learning: validateGroundingReviewLearning({ category: draft.category, applicability, error, method, check, sampleIndependent: true }) };
+  } catch (validationError) {
+    return { error: `通用经验未通过校验：${validationError instanceof Error ? validationError.message : "请检查内容"} 可修改经验，或关闭跨会话保存后继续审核。` };
+  }
+}
+
 export function GroundingReviewPanel({ request, onInput }: Props) {
   const details = request.details;
   const initialBbox = asBbox(details.bbox);
@@ -63,10 +97,13 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
   const [constraintsResolved, setConstraintsResolved] = useState(false);
   const unresolvedChecks = details.constraintAssessment !== undefined && !details.constraintAssessment.canLock;
   const [rejectionReason, setRejectionReason] = useState("");
-  const [learningAdvice, setLearningAdvice] = useState("");
   const [learningCategory, setLearningCategory] = useState<GroundingLearningCategory>("other");
-  const [learningScope, setLearningScope] = useState<GroundingLearningScope>("similar");
-  const [rememberLearning, setRememberLearning] = useState(true);
+  const [learningApplicability, setLearningApplicability] = useState("");
+  const [learningError, setLearningError] = useState("");
+  const [learningMethod, setLearningMethod] = useState("");
+  const [learningCheck, setLearningCheck] = useState("");
+  const [learningSampleIndependent, setLearningSampleIndependent] = useState(false);
+  const [rememberLearning, setRememberLearning] = useState(false);
   const [submission, setSubmission] = useState<"confirm" | "reject" | "submitted" | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   // State alone does not guard two clicks delivered before React re-renders.
@@ -79,7 +116,16 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
   const imageUrl = `data:${details.image.mimeType};base64,${details.image.data}`;
   const imageReady = loadedImage === imageUrl && failedImage !== imageUrl;
   const busy = submission !== null;
-  const learningInvalid = rememberLearning && learningAdvice.trim().length > 0 && learningAdvice.trim().length < 8;
+  const preparedLearning = prepareGroundingReviewLearning(rememberLearning, {
+    category: learningCategory,
+    applicability: learningApplicability,
+    error: learningError,
+    method: learningMethod,
+    check: learningCheck,
+    sampleIndependent: learningSampleIndependent,
+  });
+  const learningValidationError = preparedLearning.error;
+  const learningInvalid = learningValidationError !== undefined;
 
   const width = details.image.originalWidth || details.image.width || 1;
   const height = details.image.originalHeight || details.image.height || 1;
@@ -115,15 +161,15 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
     if (unresolvedChecks && (status !== "unresolved" || confidence > 0.49) && !constraintsResolved) {
       messages.push("Keep unresolved checks at status unresolved and confidence ≤ 0.49, or explicitly confirm you resolved them below.");
     }
-    if (learningInvalid) {
-      messages.push("长期改进建议至少需要 8 个字符，或留空不保存。");
+    if (learningValidationError) {
+      messages.push(learningValidationError);
     }
     return messages;
   }, [bbox, candidateCount, candidateRank, confidence, details.expectedOrdinal, reason, status, targetFound, unresolvedChecks,
-    constraintsResolved, learningInvalid]);
+    constraintsResolved, learningValidationError]);
 
-  const learningPayload = () => rememberLearning && learningAdvice.trim().length > 0
-    ? { learning: { category: learningCategory, scope: learningScope, advice: learningAdvice.trim() } }
+  const learningPayload = () => preparedLearning.learning
+    ? { learning: preparedLearning.learning }
     : {};
 
   const send = async (action: "confirm" | "reject", payload: Record<string, unknown>) => {
@@ -158,6 +204,7 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
   };
 
   const reject = () => {
+    if (learningInvalid) return;
     void send("reject", {
       reason: rejectionReason.trim() || "The browser review rejected this candidate.",
       ...learningPayload(),
@@ -416,21 +463,19 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
               <textarea aria-label="Evidence reason" value={reason} onChange={(event) => setReason(event.target.value)} rows={3} style={{ resize: "vertical", padding: "7px 8px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg-panel)", color: "var(--text)", fontSize: 12, lineHeight: 1.4 }} />
             </label>
 
-            <div style={{ display: "grid", gap: 8, padding: "9px 10px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg-panel)" }}>
-              <div style={{ fontSize: 12, fontWeight: 650 }}>长期改进建议</div>
-              <textarea
-                aria-label="Long-term grounding improvement advice"
-                value={learningAdvice}
-                onChange={(event) => setLearningAdvice(event.target.value)}
-                rows={3}
-                maxLength={1200}
-                placeholder="例如：锁定小目标后仍要检查完整外轮廓，不能只框内部高对比区域。"
-                style={{ resize: "vertical", padding: "7px 8px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg)", color: "var(--text)", fontSize: 12, lineHeight: 1.4 }}
-              />
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <details style={{ padding: "9px 10px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg-panel)" }}>
+              <summary style={{ fontSize: 12, fontWeight: 650, cursor: "pointer" }}>通用经验（可选，新写的方法）</summary>
+              <div style={{ marginTop: 8, color: "var(--text-muted)", fontSize: 11, lineHeight: 1.5 }}>
+                请独立撰写可用于其他任务的流程，不复制或改写当前题目、审核理由或答案。此处不会自动填入样本内容；留空或关闭保存不影响当前标注。
+              </div>
+              <label style={{ display: "flex", gap: 7, alignItems: "flex-start", marginTop: 8, color: "var(--text-muted)", fontSize: 11, lineHeight: 1.4 }}>
+                <input aria-label="Save general grounding lesson" type="checkbox" checked={rememberLearning} onChange={(event) => { setRememberLearning(event.target.checked); setLearningSampleIndependent(false); }} />
+                跨会话保存这条通用经验
+              </label>
+              <fieldset disabled={!rememberLearning} style={{ display: "grid", gap: 8, margin: "8px 0 0", padding: 0, border: 0 }}>
                 <label style={{ display: "grid", gap: 4, color: "var(--text-muted)", fontSize: 11 }}>
                   问题类别
-                  <select aria-label="Learning category" value={learningCategory} onChange={(event) => setLearningCategory(event.target.value as GroundingLearningCategory)} style={{ padding: "6px 7px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg)", color: "var(--text)", fontSize: 12 }}>
+                  <select aria-label="Learning category" value={learningCategory} onChange={(event) => { setLearningCategory(event.target.value as GroundingLearningCategory); setLearningSampleIndependent(false); }} style={{ padding: "6px 7px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg)", color: "var(--text)", fontSize: 12 }}>
                     <option value="identity">目标身份</option>
                     <option value="boundary">边界完整性</option>
                     <option value="order">顺序 / 排名</option>
@@ -442,18 +487,30 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
                   </select>
                 </label>
                 <label style={{ display: "grid", gap: 4, color: "var(--text-muted)", fontSize: 11 }}>
-                  适用范围
-                  <select aria-label="Learning scope" value={learningScope} onChange={(event) => setLearningScope(event.target.value as GroundingLearningScope)} style={{ padding: "6px 7px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg)", color: "var(--text)", fontSize: 12 }}>
-                    <option value="similar">仅相似题目</option>
-                    <option value="global">所有定位任务</option>
-                  </select>
+                  适用条件（4–240 字符）
+                  <textarea aria-label="Learning applicability" value={learningApplicability} onChange={(event) => { setLearningApplicability(event.target.value); setLearningSampleIndependent(false); }} rows={2} minLength={4} maxLength={240} placeholder="这种方法适用于什么通用情形？" style={{ resize: "vertical", padding: "7px 8px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg)", color: "var(--text)", fontSize: 12, lineHeight: 1.4 }} />
                 </label>
+                <label style={{ display: "grid", gap: 4, color: "var(--text-muted)", fontSize: 11 }}>
+                  常见错误（4–400 字符）
+                  <textarea aria-label="Learning error" value={learningError} onChange={(event) => { setLearningError(event.target.value); setLearningSampleIndependent(false); }} rows={2} minLength={4} maxLength={400} placeholder="要避免哪类推理或操作错误？" style={{ resize: "vertical", padding: "7px 8px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg)", color: "var(--text)", fontSize: 12, lineHeight: 1.4 }} />
+                </label>
+                <label style={{ display: "grid", gap: 4, color: "var(--text-muted)", fontSize: 11 }}>
+                  改进方法（8–800 字符）
+                  <textarea aria-label="Learning method" value={learningMethod} onChange={(event) => { setLearningMethod(event.target.value); setLearningSampleIndependent(false); }} rows={3} minLength={8} maxLength={800} placeholder="下次应按什么步骤处理？" style={{ resize: "vertical", padding: "7px 8px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg)", color: "var(--text)", fontSize: 12, lineHeight: 1.4 }} />
+                </label>
+                <label style={{ display: "grid", gap: 4, color: "var(--text-muted)", fontSize: 11 }}>
+                  复查步骤（4–400 字符）
+                  <textarea aria-label="Learning check" value={learningCheck} onChange={(event) => { setLearningCheck(event.target.value); setLearningSampleIndependent(false); }} rows={2} minLength={4} maxLength={400} placeholder="如何检查方法是否落实，并保留未解决的不确定性？" style={{ resize: "vertical", padding: "7px 8px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg)", color: "var(--text)", fontSize: 12, lineHeight: 1.4 }} />
+                </label>
+                <label style={{ display: "flex", gap: 7, alignItems: "flex-start", color: "var(--text-muted)", fontSize: 11, lineHeight: 1.5 }}>
+                  <input aria-label="Confirm sample-independent lesson" type="checkbox" checked={learningSampleIndependent} onChange={(event) => setLearningSampleIndependent(event.target.checked)} />
+                  我已人工检查：这是一条新写的通用经验，不含原始问题或其改写、图像内容或路径、样本 ID、具体答案、坐标框或标准答案（ground truth）。
+                </label>
+              </fieldset>
+              <div style={{ marginTop: 8, color: "var(--text-dim)", fontSize: 11, lineHeight: 1.5 }}>
+                长度与词面校验不能证明语义上与样本无关，仍需人工判断。保存的经验只作参考，不覆盖当前题目、图像证据或安全规则。
               </div>
-              <label style={{ display: "flex", gap: 7, alignItems: "flex-start", color: "var(--text-muted)", fontSize: 11, lineHeight: 1.4 }}>
-                <input type="checkbox" checked={rememberLearning} onChange={(event) => setRememberLearning(event.target.checked)} />
-                跨会话保存。后续任务只把它作为人工经验，不覆盖当前题目、图像证据或安全规则。
-              </label>
-            </div>
+            </details>
 
             {validationMessages.length > 0 && (
               <div role="alert" style={{ display: "grid", gap: 4, padding: "8px 9px", border: "1px solid rgba(245,158,11,0.45)", borderRadius: 5, background: "rgba(245,158,11,0.10)", color: "var(--text-muted)", fontSize: 11, lineHeight: 1.4 }}>

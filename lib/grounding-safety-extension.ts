@@ -193,6 +193,7 @@ type LoadedBatchRecord = {
   lastCropModality?: GroundingModality;
   currentBbox?: [number, number, number, number];
   settleNudges: number;
+  awaitingClarification?: string;
   revision?: boolean;
   humanApprovalId?: string;
   views: GroundingViewRegistry;
@@ -203,6 +204,7 @@ type LoadedBatchRecord = {
 
 type PersistedGroundingPending = {
   key: string;
+  awaitingClarification?: string;
   currentBbox?: [number, number, number, number];
   workingState?: GroundingWorkingState;
   revision?: boolean;
@@ -1731,6 +1733,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           record,
           grantedModalities,
           settleNudges: 0,
+          ...(pending?.awaitingClarification ? { awaitingClarification: pending.awaitingClarification } : {}),
           ...(pending?.currentBbox ? { currentBbox: pending.currentBbox } : {}),
           ...(workingState ? { workingState } : {}),
           ...(pending?.revision ? { revision: true } : {}),
@@ -1744,6 +1747,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         if (current) {
           persistedPending = {
             key: current[0],
+            ...(current[1].awaitingClarification ? { awaitingClarification: current[1].awaitingClarification } : {}),
             ...(current[1].currentBbox ? { currentBbox: current[1].currentBbox } : {}),
             ...(current[1].workingState ? { workingState: current[1].workingState } : {}),
             ...(current[1].revision ? { revision: true } : {}),
@@ -1758,14 +1762,44 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         const current = loadedBatchRecords.entries().next().value as [string, LoadedBatchRecord] | undefined;
         const pendingKey = current?.[0] ?? persistedPending?.key;
         const pendingRevision = current?.[1].revision ?? persistedPending?.revision;
+        const clarification = current?.[1].awaitingClarification ?? persistedPending?.awaitingClarification;
         return { targetCount: requestedRecordLimit ?? null, approvedInJob: sessionSavedCount,
           currentKey: pendingKey ?? null, lastApprovedKey: lastApprovedKey ?? null,
           pendingCorrectionKey: pendingRevision ? pendingKey ?? null : null,
-          reviewStatus: savingRecord ? "awaiting_review_or_saving" : pendingKey ? "awaiting_prediction" : "idle",
+          reviewStatus: savingRecord ? "awaiting_review_or_saving" : clarification ? "awaiting_clarification" : pendingKey ? "awaiting_prediction" : "idle",
+          ...(clarification ? { clarification } : {}),
           completionReached: batchExhausted && !jobRestoreWarning,
           ...(jobRestoreWarning ? { restorationWarning: jobRestoreWarning } : {}),
           requestedLimitReached: requestedRecordLimit !== undefined && sessionSavedCount >= requestedRecordLimit };
       };
+
+      const pendingClarification = () => {
+        const current = loadedBatchRecords.entries().next().value as [string, LoadedBatchRecord] | undefined;
+        const question = current?.[1].awaitingClarification ?? persistedPending?.awaitingClarification;
+        const key = current?.[0] ?? persistedPending?.key;
+        return question && key ? { key, question } : undefined;
+      };
+
+      const clarificationPauseResult = () => {
+        const pending = pendingClarification();
+        if (!pending) return undefined;
+        const details = { ...pending, saved: false, paused: true, nextAction: "await_user_clarification", job: jobSnapshot() };
+        return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details, terminate: true };
+      };
+
+      // Actual human input releases the wait, including a short answer or an
+      // image-only correction. Extension follow-ups and output-limit recovery
+      // are not answers. Nothing here saves, approves, or advances a record.
+      pi.on("input", (event) => {
+        if ((event.source !== "interactive" && event.source !== "rpc")
+          || (!event.text.trim() && !event.images?.length) || !pendingClarification()) return undefined;
+        const current = loadedBatchRecords.values().next().value as LoadedBatchRecord | undefined;
+        if (current) delete current.awaitingClarification;
+        if (persistedPending) delete persistedPending.awaitingClarification;
+        settleRecoveryAllowed = false;
+        persistJob();
+        return undefined;
+      });
 
       const reportCompletion = (completed: number, total: number, outputDir: string) => {
         pi.sendMessage({
@@ -1947,11 +1981,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         const imageDetails: GroundingImage["details"][] = [];
         if (current) {
           try {
-            const lessons = await selectGroundingLessons(
-              current[1].record.query ?? "",
-              payload.includedModalities,
-              { filePath: options.learningPath },
-            );
+            const lessons = await selectGroundingLessons({ filePath: options.learningPath });
             if (lessons.length > 0) {
               content.push({ type: "text", text: JSON.stringify({ groundingReviewLessons: groundingLessonsForModel(lessons) }) });
             }
@@ -1994,6 +2024,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       ) => {
         signal?.throwIfAborted();
         if (!active) throw new Error("Grounding runtime safety is not active for this session.");
+        if (pendingClarification()) throw new Error("This record is awaiting the user's clarification. Do not propose, save, or advance it until the user responds.");
         const { sourcePath, state } = await loadQueryState(params.queryPath);
         if (!Object.hasOwn(state.safe, params.key)) throw new Error(`Unknown grounding key: ${params.key}`);
         const outputDirectory = resolvedOutputDirectory(options.cwd, sourcePath, params.outputDir);
@@ -2119,12 +2150,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         let learningWarning: string | undefined;
         if (review.learning) {
           try {
-            await appendGroundingLesson({
-              outcome: review.action === "confirm" ? "confirmed" : "rejected",
-              query: loaded.record.query ?? "",
-              modalities: Array.from(loaded.grantedModalities),
-              learning: review.learning,
-            }, options.learningPath);
+            await appendGroundingLesson(review.learning, options.learningPath);
             learningSaved = true;
           } catch (error) {
             learningWarning = `The review was accepted, but its long-term lesson could not be saved: ${(error as Error).message}`;
@@ -2134,7 +2160,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           reviewInterrupted = true;
           throw new Error(
             `Browser grounding review rejected candidate: ${review.reason}. `
-            + `${review.learning ? `Human improvement guidance: ${review.learning.advice}. ` : ""}`
+            + `${review.learning ? "The human also supplied a general procedure. " : ""}`
             + "Revise this same record and request review again; do not load the next record."
             + (learningWarning ? ` ${learningWarning}` : ""),
           );
@@ -2282,6 +2308,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         }),
         executionMode: "sequential",
         async execute(_toolCallId, params) {
+          const paused = clarificationPauseResult();
+          if (paused) return paused;
           // Tool use is authoritative: users should not need to write a
           // special "batch" keyword merely to unlock record views and the
           // serial save/continue safeguards.
@@ -2315,8 +2343,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         return { queryPath, outputDir };
       };
 
-      const resolveLoadedRecord = (params: { key?: string; queryPath?: string }) => {
+      const resolveLoadedRecord = (params: { key?: string; queryPath?: string }, allowClarification = false) => {
         if (!active) throw new Error("Grounding runtime safety is not active for this session.");
+        if (!allowClarification && pendingClarification()) throw new Error("This record is awaiting the user's clarification. Wait for their response instead of repeating inspection.");
         const current = params.key ? [params.key, loadedBatchRecords.get(params.key)] as const : loadedBatchRecords.entries().next().value;
         if (!current?.[1]) throw new Error("Load this record with grounding_next_batch or grounding_reopen_record before viewing evidence.");
         if (params.queryPath && normalizePath(resolve(options.cwd, params.queryPath)) !== normalizePath(current[1].sourcePath)) throw new Error("Use the currently loaded record's queryPath.");
@@ -2393,7 +2422,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             const belongsHere = loaded && normalizePath(loaded.sourcePath) === normalizePath(sourcePath)
               && normalizePath(loaded.outputDirectory) === normalizePath(outputDir);
             return { key, query: record.query,
-              state: belongsHere ? "awaiting_prediction_or_review" : progress.has(key) ? "approved" : "unfinished",
+              state: sameJob && pendingClarification()?.key === key ? "awaiting_clarification"
+                : belongsHere ? "awaiting_prediction_or_review" : progress.has(key) ? "approved" : "unfinished",
               ...(progress.has(key) ? { approvedPrediction: (() => {
                 const saved = progress.get(key)!;
                 // A 20-row status page must not repeat 20 full evidence
@@ -2411,7 +2441,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             remaining: entries.length - completed, records, nextOffset: offset + records.length < entries.length ? offset + records.length : null,
             job: sameJob ? jobSnapshot() : null,
             note: "Approved predictions are this run's own results, not ground truth. Reopen a specific key to revise it; approval is still required." };
-          return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
+          return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details,
+            ...(pendingClarification() ? { terminate: true } : {}) };
         },
       });
 
@@ -2425,6 +2456,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         executionMode: "sequential",
         async execute(_id, params) {
           if (!active) throw new Error("Grounding runtime safety is not active for this session.");
+          const paused = clarificationPauseResult();
+          if (paused) return paused;
           if (loadedBatchRecords.size || savingRecord) throw new Error("Finish reviewing the currently loaded record before reopening another key.");
           const job = resolveGroundingJob(params);
           const { sourcePath, state } = await loadQueryState(job.queryPath);
@@ -2523,7 +2556,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       pi.registerTool({
         name: "grounding_evidence",
         label: "Grounding working evidence",
-        description: "Keep a short evidence state and choose which views remain in model context. Separate direct visible facts from unverified identity/part hypotheses. Pin useful views, archive superseded images, or restore them; full transcript and user corrections are never deleted.",
+        description: "Keep short factual evidence and choose which views remain in context. Pin, archive or restore views without deleting history. Optional clarification asks the user a concrete question and pauses this unsaved record without requiring a box.",
         promptGuidelines: [
           "facts must contain only direct visible observations. Put interpretations such as 'this dark line is the beak' in hypotheses until structural evidence verifies the object and part. A color match alone never promotes a hypothesis to a fact.",
           "Keep the original query and the user's target requirements intact in state.target; put changing candidate identities in hypotheses, not in place of the requested target. Record hypotheses, open questions and ruled-out candidates concisely, not private deliberation. An evidence update is not required for every crop; use another view only for a concrete unresolved question.",
@@ -2531,11 +2564,13 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Before locking, record state.contract; when ready to submit, you may instead attach contract directly to the save call. Omit originalQuery to use the exact loaded query; any supplied value must match it. Keep queryCoverage, plausible interpretations with requirements[].queryText, candidate IDs/source boxes and identity evidence. queryText belongs inside requirements, not interpretations. Preserve conflicting readings rather than silently choosing one. Support remains a declaration, not a machine proof.",
           "For ordered targets each interpretation declares spatialOrder axis (x/y), direction (ascending is left-to-right/top-to-bottom, descending the reverse), ordinal and candidateIds. Keep the total serialized contract at most 32 KiB and queryText excerpts at most 600 characters; shorten evidence, never the original query. The runtime sorts source centers independently of discovery/array order. Declare candidateSet unresolved if membership/count is uncertain. Identity basis is visual_structure only for actual visible structure; repeated_view/pixel_measurement cannot prove identity. Alternatives rejected by evidence stay as contradicted interpretations.",
           "Missing or unresolved contracts stay reviewable as unresolved at low confidence; no extra color/crop call is required. Unsupported locks are returned as reconsidering with explicit constraintAssessment issues. Fix only what current evidence supports; never fabricate evidence to clear a check.",
+          "If the referent or requested rank cannot be established and there is no concrete remaining visual check, pass clarification with one specific question for the user. This ends the current run and waits on the same unsaved record without requiring a box. A real user response releases the wait; it never approves, saves or advances. Use ordinary unresolved human review instead when a best-supported proposal is useful.",
           "As soon as identity and every required order/relation are established, set state.selection to locked with a rough source-normalized bbox and direct evidence. Locked means no identity or rank check remains; it is not a tentative pick. This limits later views to target boundary measurement. Use reconsidering while comparison is still needed or after naming new visible counterevidence; a generic possibility of hidden candidates is not counterevidence.",
           "Archive only superseded or redundant views after keeping the evidence and counterexamples that matter. Pin overrides archive; the record's original overview stays available. For a comparison image, every panel viewId must be archived before that whole image is omitted.",
         ],
         parameters: Type.Object({
           key: Type.Optional(Type.String()),
+          clarification: Type.Optional(Type.String({ minLength: 1, maxLength: 400, description: "Ask one concrete question about an unresolved referent, then pause this unsaved record for the user's answer. No bbox or contract is required; no saving or next record." })),
           pin: Type.Optional(Type.Array(Type.String(), { maxItems: 100 })),
           archive: Type.Optional(Type.Array(Type.String(), { maxItems: 100 })),
           restore: Type.Optional(Type.Array(Type.String(), { maxItems: 100 })),
@@ -2556,7 +2591,13 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         }),
         executionMode: "sequential",
         async execute(_id, params) {
-          const [key, loaded] = resolveLoadedRecord(params);
+          const paused = clarificationPauseResult();
+          if (paused) return paused;
+          const [key, loaded] = resolveLoadedRecord(params, true);
+          if (params.clarification !== undefined && (typeof params.clarification !== "string" || !params.clarification.trim() || params.clarification.length > 400)) {
+            throw new Error("Clarification must be a nonempty question of at most 400 characters.");
+          }
+          if (params.clarification !== undefined && savingRecord) throw new Error("The current record is already awaiting human review; wait for that review rather than opening another question.");
           const patch = params.state === undefined ? undefined : validateGroundingWorkingState(params.state, loaded.record.query ?? "");
           let state = patch === undefined ? loaded.workingState : { ...loaded.workingState, ...patch };
           if (state?.contract) validateGroundingConstraintContract(state.contract, loaded.record.query ?? "");
@@ -2581,7 +2622,15 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           } else if (patch?.selection && state?.selection?.status === "reconsidering") {
             loaded.currentBbox = undefined;
           }
+          if (params.clarification !== undefined) loaded.awaitingClarification = params.clarification.trim();
           persistJob();
+          if (loaded.awaitingClarification) {
+            // The tool terminates the run, so show the actual question without
+            // depending on another model response. Repeated calls only return
+            // the existing wait and never publish duplicate questions.
+            pi.sendMessage({ customType: "grounding-clarification", content: loaded.awaitingClarification, display: true }, { triggerTurn: false });
+            return clarificationPauseResult()!;
+          }
           const all = loaded.views.list();
           const offset = params.offset ?? 0;
           const views = all.slice(offset, offset + (params.limit ?? 20)).map((view) => ({ ...view,
@@ -2976,8 +3025,17 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         },
       });
 
+      // A tool's terminate flag only ends an ALL-terminating tool batch in
+      // the SDK. A preceding normal result (or malformed sibling call) would
+      // otherwise permit another model request. At turn_end all assistant/tool
+      // messages are persisted, and queued custom UI messages are flushed by
+      // the session. Abort the run here without awaiting idle inside its hook.
+      pi.on("turn_end", (_event, ctx) => {
+        if (active && batchMode && pendingClarification()) ctx.abort();
+      });
+
       pi.on("agent_before_settle", (event) => {
-        if (!active || !batchMode || !settleRecoveryAllowed || savingRecord || reviewInterrupted || event.outcome !== "completed") return undefined;
+        if (!active || !batchMode || !settleRecoveryAllowed || savingRecord || reviewInterrupted || pendingClarification() || event.outcome !== "completed") return undefined;
         // In pi 0.87 an assistant-tail context (including stopReason="length")
         // has canContinue=false. Our custom_message supplies the next user-role
         // input, and the SDK validates continuation again after committing it.
@@ -3039,7 +3097,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             display: false,
             content: outputLimitCue + `Grounding record ${key} is still unsaved. `
               + `Original query: ${JSON.stringify(loaded.record.query ?? "")}. `
-              + "Use the image already in context and reconcile the best-supported single normalized bbox with all original query requirements before calling grounding_save_result or grounding_save_and_next for human review. If a required condition remains unestablished, submit it as unresolved with low confidence and explain what is missing; do not invent certainty to finish.",
+              + "Use the image already in context and reconcile the best-supported single normalized bbox with all original query requirements before calling grounding_save_result or grounding_save_and_next for human review. If a required condition remains unestablished, submit it as unresolved with low confidence and explain what is missing; do not invent certainty to finish. If no grounded proposal or useful visual check remains, use grounding_evidence clarification to ask one concrete question and wait on this same record without a box.",
           }],
           continue: true,
         };
@@ -3078,6 +3136,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
                     if (pending.workingState !== undefined) workingState = validateGroundingWorkingState(pending.workingState);
                     persistedPending = {
                       key: pending.key,
+                      ...(typeof pending.awaitingClarification === "string" && pending.awaitingClarification.trim().length > 0
+                        && pending.awaitingClarification.length <= 400 ? { awaitingClarification: pending.awaitingClarification.trim() } : {}),
                       ...(currentBbox ? { currentBbox } : {}),
                       ...(workingState ? { workingState } : {}),
                       ...(pending.revision === true ? { revision: true } : {}),
@@ -3185,6 +3245,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Separate target identity, part selection and boundary measurement. Color membership is not object identity: point no_match does not prove absence and largest can be background. Do not invent thermal properties to justify an infrared interpretation.",
           "Keep a short factual state with grounding_evidence (target, facts, hypotheses, openQuestions, ruledOut, selection). Facts are direct visible observations. Put interpretations such as 'the nearby dark line is the beak' in hypotheses until structure verifies both the object and part. A generic possibility that another target may be hidden is not an open question. Pin important views; archive redundant images when they add no evidence.",
           "Every additional view should resolve a specific remaining question. Repeated zoom of the same source pixels cannot add texture. Preserve unresolved alternatives instead of restarting all guesses. A request to analyze past mistakes does not itself request new annotation.",
+          "When the observed count is below the requested rank, do not promote the last visible object or keep searching for hypothetical hidden members. Further inspection needs a concrete observed ambiguity. If no useful visual check remains and a referent needs clarification, call grounding_evidence with clarification set to one concrete question; the same unsaved record waits for actual user input without requiring a bbox or automatic continuation. A useful best-supported proposal may instead use ordinary unresolved human review.",
           "Use grounding_save_and_next between requested records and grounding_save_result for the final record or revision. Each save requires a reason naming visible structural evidence for the chosen identity, part and boundaries. If the proposed box materially moves from the prior candidate, explain the new visible evidence before submitting it. If save_result returns nextAction grounding_next_batch, continue that same job.",
           "The browser review displays the previous and proposed boxes on a clean full image when the candidate changed. The approved prediction edges are saved exactly; never add padding for a small target. Every saved result is returned as a red annotated overlay image.",
           "A small approved box can return an automatic magnified verification crop. That crop only improves inspection and never changes or expands the saved prediction.",
@@ -3203,6 +3264,11 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
 
       pi.on("tool_call", async (event: ToolCallEvent) => {
         if (!active) return undefined;
+        const clarification = pendingClarification();
+        if (clarification && GROUNDING_TOOL_NAMES.includes(event.toolName as typeof GROUNDING_TOOL_NAMES[number])
+          && !["grounding_status", "grounding_evidence"].includes(event.toolName)) {
+          return { ...block(`Record ${clarification.key} is awaiting the user's clarification: ${clarification.question} Do not retry inspection, review or advance before an actual user response.`), terminate: true };
+        }
 
         if (event.toolName === "read") {
           const path = String(event.input.path ?? "");
