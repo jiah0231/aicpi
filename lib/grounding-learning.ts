@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { mkdir, open, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type {
@@ -13,6 +13,7 @@ const MAX_ADVICE_CHARACTERS = 1200;
 const MAX_QUERY_CHARACTERS = 1000;
 const DEFAULT_RESULT_LIMIT = 6;
 const MAX_RESULT_LIMIT = 12;
+const RESERVED_GLOBAL_SLOTS = 2;
 
 const CATEGORIES = new Set<GroundingLearningCategory>([
   "identity",
@@ -140,7 +141,22 @@ export async function appendGroundingLesson(
   const previous = queues.get(filePath) ?? Promise.resolve();
   const pending = previous.catch(() => {}).then(async () => {
     await mkdir(dirname(filePath), { recursive: true });
-    await appendFile(filePath, `${JSON.stringify(lesson)}\n`, "utf8");
+    const file = await open(filePath, "a+");
+    try {
+      const { size } = await file.stat();
+      let separator = "";
+      if (size > 0) {
+        const tail = Buffer.alloc(1);
+        const { bytesRead } = await file.read(tail, 0, 1, size - 1);
+        if (bytesRead !== 1) throw new Error("Grounding lessons changed while preparing an append.");
+        // Preserve even an invalid/truncated tail byte-for-byte. Separating it
+        // from the new row lets readers recover without losing either row.
+        if (tail[0] !== 0x0a) separator = "\n";
+      }
+      await file.appendFile(`${separator}${JSON.stringify(lesson)}\n`, "utf8");
+    } finally {
+      await file.close();
+    }
   });
   queues.set(filePath, pending);
   try {
@@ -174,9 +190,13 @@ export async function readGroundingLessons(filePath = groundingLessonsPath()): P
 
 function queryTokens(value: string): Set<string> {
   const tokens = new Set<string>();
-  for (const token of value.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []) {
+  // Segment scripts before extracting words: 第1个墙壁开关 and USB插座
+  // otherwise become opaque mixed-script tokens with no reusable Han bigrams.
+  const segmented = value.toLocaleLowerCase().replace(/(\p{Script=Han}+)/gu, " $1 ");
+  for (const token of segmented.match(/[\p{L}\p{N}]+/gu) ?? []) {
     if (/^\p{Script=Han}+$/u.test(token)) {
-      for (let index = 0; index < token.length - 1; index += 1) tokens.add(token.slice(index, index + 2));
+      const characters = [...token];
+      for (let index = 0; index < characters.length - 1; index += 1) tokens.add(characters[index] + characters[index + 1]);
     } else if (token.length >= 3 && !TOKEN_STOP_WORDS.has(token)) {
       tokens.add(token);
     }
@@ -194,12 +214,12 @@ export async function selectGroundingLessons(
   const currentModalities = new Set(modalities);
   const limit = Math.min(MAX_RESULT_LIMIT, Math.max(1, options.limit ?? DEFAULT_RESULT_LIMIT));
   const seenAdvice = new Set<string>();
-  return lessons
+  const ranked = lessons
     .map((lesson, index) => {
       const overlap = [...queryTokens(lesson.query)].filter((token) => currentTokens.has(token)).length;
       const modalityOverlap = lesson.modalities.filter((item) => currentModalities.has(item)).length;
       const relevant = lesson.scope === "global" || overlap > 0;
-      return { lesson, index, relevant, score: (lesson.scope === "global" ? 100 : 0) + overlap * 10 + modalityOverlap };
+      return { lesson, index, relevant, score: overlap * 10 + modalityOverlap };
     })
     .filter((item) => item.relevant)
     .sort((left, right) => right.score - left.score || right.index - left.index)
@@ -208,9 +228,19 @@ export async function selectGroundingLessons(
       if (seenAdvice.has(key)) return false;
       seenAdvice.add(key);
       return true;
-    })
-    .slice(0, limit)
-    .map((item) => item.lesson);
+    });
+  const similar = ranked.filter(({ lesson }) => lesson.scope === "similar");
+  const global = ranked.filter(({ lesson }) => lesson.scope === "global");
+  // Keep some general guidance, but leave room for query-specific
+  // lessons. Global advice can fill spare slots when few similar lessons match.
+  const reservedGlobals = Math.min(RESERVED_GLOBAL_SLOTS, Math.floor(limit / 2));
+  const globalLimit = Math.max(reservedGlobals, limit - similar.length);
+  const selectedGlobals = global.slice(0, globalLimit);
+  const selected = new Set([
+    ...selectedGlobals,
+    ...similar.slice(0, limit - selectedGlobals.length),
+  ]);
+  return ranked.filter((item) => selected.has(item)).map((item) => item.lesson);
 }
 
 export function groundingLessonsForModel(lessons: GroundingLesson[]) {

@@ -116,6 +116,28 @@ export class GroundingViewRegistry {
     return [...this.views.values()].map(cloneDescriptor);
   }
 
+  private availableViewIds(modality?: GroundingViewDescriptor["modality"]): string {
+    const views = [...this.views.values()].filter((view) => !modality || view.modality === modality);
+    const recent = views.slice(-6).reverse();
+    const scope = modality ? `${modality} ` : "";
+    if (!recent.length) return `No ${scope}viewIds are registered for the current record.`;
+    const limit = views.length > recent.length ? ` (most recent ${recent.length} of ${views.length})` : "";
+    return `Available ${scope}viewIds${limit}: ${recent.map((view) => `${view.id} (${view.modality})`).join(", ")}.`;
+  }
+
+  private requireView(id: string): GroundingViewDescriptor {
+    const view = this.views.get(id);
+    if (!view) throw new Error(`Unknown or stale viewId. Use the view that supplied the measured coordinates for the current record. ${this.availableViewIds()}`);
+    return view;
+  }
+
+  private requireVisibleView(id: string): void {
+    const view = this.requireView(id);
+    if (view.modality !== "visible") {
+      throw new Error(`viewId ${view.id} is ${view.modality}, not visible. ${view.modality}-to-visible registration is unsupported; equal image dimensions do not establish alignment. Remeasure the coordinates on a visible view for this record. ${this.availableViewIds("visible")}`);
+    }
+  }
+
   findEquivalent(input: Pick<GroundingViewDescriptor, "modality" | "region" | "sourceWidth" | "sourceHeight">): GroundingViewDescriptor | undefined {
     const view = [...this.views.values()].find((candidate) => candidate.modality === input.modality
       && candidate.sourceWidth === input.sourceWidth && candidate.sourceHeight === input.sourceHeight
@@ -178,9 +200,9 @@ export class GroundingViewRegistry {
     };
   }
 
+  /** Maps within the view's own source modality; this does not register IR/depth to visible. */
   toSource(id: string, box: readonly number[], space: "view_pixels" | "view_normalized"): GroundingViewBox {
-    const view = this.views.get(id);
-    if (!view) throw new Error("Unknown or stale viewId. Use a view returned for the current record.");
+    const view = this.requireView(id);
     if (space !== "view_pixels" && space !== "view_normalized") throw new Error("Unknown view coordinate space.");
     validBox(box, "bbox");
     const rect = view.displayRect ?? [0, 0, view.width, view.height];
@@ -201,9 +223,9 @@ export class GroundingViewRegistry {
     return [map(box[0], 0), map(box[1], 1), map(box[2], 0), map(box[3], 1)];
   }
 
+  /** Maps within the view's own source modality; this does not register IR/depth to visible. */
   toSourcePoint(id: string, point: readonly number[], space: "view_pixels" | "view_normalized"): [number, number] {
-    const view = this.views.get(id);
-    if (!view) throw new Error("Unknown or stale viewId. Use a view returned for the current record.");
+    const view = this.requireView(id);
     if (space !== "view_pixels" && space !== "view_normalized") throw new Error("Unknown view coordinate space.");
     if (!Array.isArray(point) || point.length !== 2 || point.some((value) => !Number.isFinite(value))) {
       throw new Error("point must contain two finite coordinates.");
@@ -219,6 +241,18 @@ export class GroundingViewRegistry {
     const map = (value: number, axis: 0 | 1) => region[axis]
       + ((value - bounds[axis]) / (bounds[axis + 2] - bounds[axis])) * (region[axis + 2] - region[axis]);
     return [map(point[0], 0), map(point[1], 1)];
+  }
+
+  /** Visible-source boxes for saving or color analysis require visible measurement provenance. */
+  toVisibleSource(id: string, box: readonly number[], space: "view_pixels" | "view_normalized"): GroundingViewBox {
+    this.requireVisibleView(id);
+    return this.toSource(id, box, space);
+  }
+
+  /** Visible-source points for color sampling require visible measurement provenance. */
+  toVisibleSourcePoint(id: string, point: readonly number[], space: "view_pixels" | "view_normalized"): [number, number] {
+    this.requireVisibleView(id);
+    return this.toSourcePoint(id, point, space);
   }
 }
 

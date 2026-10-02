@@ -34,6 +34,22 @@ function isValidBbox(bbox: Bbox): boolean {
     && bbox[1] < bbox[3];
 }
 
+export function mapBboxToBoundaryPreview(bbox: Bbox, region: Bbox) {
+  if (!isValidBbox(region) || !isValidBbox(bbox)) return null;
+  const regionWidth = region[2] - region[0];
+  const regionHeight = region[3] - region[1];
+  // Preserve the source box, including edges outside this fixed crop. The
+  // preview container clips the drawing only, never the submitted coordinates.
+  return {
+    left: (bbox[0] - region[0]) / regionWidth,
+    top: (bbox[1] - region[1]) / regionHeight,
+    width: (bbox[2] - bbox[0]) / regionWidth,
+    height: (bbox[3] - bbox[1]) / regionHeight,
+    extendsBeyondPreview: bbox[0] < region[0] || bbox[1] < region[1]
+      || bbox[2] > region[2] || bbox[3] > region[3],
+  };
+}
+
 export function GroundingReviewPanel({ request, onInput }: Props) {
   const details = request.details;
   const initialBbox = asBbox(details.bbox);
@@ -57,6 +73,9 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
   const submissionLocked = useRef(false);
   const [loadedImage, setLoadedImage] = useState<string | null>(null);
   const [failedImage, setFailedImage] = useState<string | null>(null);
+  const [loadedBoundaryImage, setLoadedBoundaryImage] = useState<string | null>(null);
+  const [failedBoundaryImage, setFailedBoundaryImage] = useState<string | null>(null);
+  const [showBoundaryOutline, setShowBoundaryOutline] = useState(true);
   const imageUrl = `data:${details.image.mimeType};base64,${details.image.data}`;
   const imageReady = loadedImage === imageUrl && failedImage !== imageUrl;
   const busy = submission !== null;
@@ -64,6 +83,18 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
 
   const width = details.image.originalWidth || details.image.width || 1;
   const height = details.image.originalHeight || details.image.height || 1;
+  const boundaryPreview = details.boundaryPreview;
+  const boundaryWidth = boundaryPreview?.image.width || boundaryPreview?.image.originalWidth || 0;
+  const boundaryHeight = boundaryPreview?.image.height || boundaryPreview?.image.originalHeight || 0;
+  const boundaryPreviewValid = boundaryPreview !== undefined && isValidBbox(boundaryPreview.region)
+    && Number.isFinite(boundaryWidth) && boundaryWidth > 0
+    && Number.isFinite(boundaryHeight) && boundaryHeight > 0;
+  const boundaryImageUrl = boundaryPreviewValid
+    ? `data:${boundaryPreview.image.mimeType};base64,${boundaryPreview.image.data}`
+    : null;
+  const boundaryImageReady = boundaryImageUrl !== null
+    && loadedBoundaryImage === boundaryImageUrl && failedBoundaryImage !== boundaryImageUrl;
+  const boundaryBox = boundaryPreviewValid ? mapBboxToBoundaryPreview(bbox, boundaryPreview.region) : null;
   const pixelBbox = bbox.map((value, index) => Math.round(value * (index % 2 === 0 ? width : height)));
   const validationMessages = useMemo(() => {
     const messages: string[] = [];
@@ -204,6 +235,7 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 300px), 1fr))", gap: 16, minHeight: 0, overflow: "auto", padding: 16 }}>
           <div style={{ minWidth: 0 }}>
+            <div style={{ marginBottom: 7, fontSize: 12, fontWeight: 650 }}>全图概览</div>
             <div style={{ position: "relative", width: "100%", aspectRatio: `${width} / ${height}`, overflow: "hidden", border: "1px solid var(--border)", borderRadius: 7, background: "#111" }}>
               <img src={imageUrl} alt={`Full image for ${details.key}`} draggable={false} onLoad={() => { setLoadedImage(imageUrl); setFailedImage(null); }} onError={() => setFailedImage(imageUrl)} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain", userSelect: "none" }} />
               {imageReady && previousBoxStyle && <div aria-label="Previous candidate bounding box" style={previousBoxStyle} />}
@@ -234,6 +266,59 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
             {details.candidateChange && (
               <div role={details.candidateChange.materialChange ? "alert" : "status"} style={{ marginTop: 8, padding: "7px 9px", borderRadius: 5, background: details.candidateChange.materialChange ? "rgba(245,158,11,0.12)" : "rgba(34,211,238,0.08)", color: "var(--text-muted)", fontSize: 11, lineHeight: 1.45 }}>
                 Candidate change: IoU {details.candidateChange.iou.toFixed(3)} · center Δ [{details.candidateChange.centerDeltaPixels.map((value) => value.toFixed(1)).join(", ")}] px · area ×{details.candidateChange.areaRatio.toFixed(2)}. {details.candidateChange.note}
+              </div>
+            )}
+            <div style={{ marginTop: 12, padding: "9px 10px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg-panel)", color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}>
+              通过前请逐一检查左、上、右、下四条边，覆盖目标完整的可见外轮廓，包括尾部、果皮、圆顶和低对比度边缘；除非题目明确只要求某个部分。请结合全图确认目标，局部放大供你人工复核边界。
+            </div>
+            {boundaryImageUrl !== null ? (
+              <section aria-label="Boundary detail preview" style={{ marginTop: 12, minWidth: 0 }}>
+                <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 7 }}>
+                  <div style={{ fontSize: 12, fontWeight: 650 }}>边界放大 · 可见光原图裁剪</div>
+                  <button
+                    type="button"
+                    aria-label="Show boundary preview outline"
+                    aria-pressed={showBoundaryOutline}
+                    disabled={busy}
+                    onClick={() => setShowBoundaryOutline((current) => !current)}
+                    style={{ minHeight: 36, padding: "5px 8px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg-panel)", color: "var(--text-muted)", cursor: busy ? "not-allowed" : "pointer", fontSize: 11 }}
+                  >
+                    {showBoundaryOutline ? "隐藏边框，查看干净像素" : "显示当前边框"}
+                  </button>
+                </div>
+                <div style={{ position: "relative", width: "100%", aspectRatio: `${boundaryWidth} / ${boundaryHeight}`, overflow: "hidden", border: "1px solid var(--border)", borderRadius: 7, background: "#111" }}>
+                  <img
+                    src={boundaryImageUrl}
+                    alt={`Clean visible-image boundary crop for ${details.key}`}
+                    draggable={false}
+                    onLoad={() => { setLoadedBoundaryImage(boundaryImageUrl); setFailedBoundaryImage(null); }}
+                    onError={() => setFailedBoundaryImage(boundaryImageUrl)}
+                    style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain", userSelect: "none" }}
+                  />
+                  {boundaryImageReady && showBoundaryOutline && boundaryBox && (
+                    <div
+                      aria-label="Boundary preview current bounding box"
+                      style={{ position: "absolute", left: `${boundaryBox.left * 100}%`, top: `${boundaryBox.top * 100}%`, width: `${boundaryBox.width * 100}%`, height: `${boundaryBox.height * 100}%`, boxSizing: "border-box", border: "1px solid #f97316", background: "transparent", pointerEvents: "none" }}
+                    />
+                  )}
+                </div>
+                {!boundaryImageReady && (
+                  <div role={failedBoundaryImage === boundaryImageUrl ? "alert" : "status"} style={{ marginTop: 7, color: "var(--text-muted)", fontSize: 11, lineHeight: 1.5 }}>
+                    {failedBoundaryImage === boundaryImageUrl ? "局部预览加载失败，请使用上方全图审核。" : "局部预览加载中…"}
+                  </div>
+                )}
+                <div style={{ marginTop: 7, color: "var(--text-dim)", fontSize: 11, lineHeight: 1.5 }}>
+                  裁剪范围固定，边框随坐标编辑更新；隐藏边框可检查被线条遮住的边缘。
+                </div>
+                {boundaryBox?.extendsBeyondPreview && (
+                  <div role="status" style={{ marginTop: 7, padding: "7px 9px", borderRadius: 5, background: "rgba(245,158,11,0.12)", color: "var(--text-muted)", fontSize: 11, lineHeight: 1.5 }}>
+                    当前标注框超出局部预览范围，只显示落在裁剪内的边框。请在上方全图核对超出部分；提交坐标保持不变。
+                  </div>
+                )}
+              </section>
+            ) : boundaryPreview !== undefined && (
+              <div role="status" style={{ marginTop: 8, color: "var(--text-muted)", fontSize: 11, lineHeight: 1.5 }}>
+                局部预览信息无效，请使用上方全图审核。
               </div>
             )}
           </div>

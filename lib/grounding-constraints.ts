@@ -103,7 +103,12 @@ function object(input: unknown, field: string, keys: readonly string[]): Record<
   }
   const value = input as Record<string, unknown>;
   for (const key of Object.keys(value)) {
-    if (!keys.includes(key)) throw new Error(`Unknown grounding contract ${field} field: ${key}`);
+    if (!keys.includes(key)) {
+      const hint = key === "queryText" && /^interpretations\[\d+\]$/.test(field)
+        ? " Put queryText inside each requirements[] item, not on the interpretation. Keep the existing observations; repair only this field."
+        : ` Allowed fields: ${keys.join(", ")}.`;
+      throw new Error(`Unknown grounding contract ${field} field: ${key}.${hint}`);
+    }
   }
   return value;
 }
@@ -157,16 +162,19 @@ function unique(ids: readonly string[], field: string): void {
 /** Strict bounded structure; incomplete knowledge uses explicit unresolved states. */
 export function validateGroundingConstraintContract(input: unknown, originalQuery?: string): GroundingConstraintContract {
   const value = object(input, "root", ["originalQuery", "queryCoverage", "interpretations", "candidates", "selectedCandidateId"]);
+  // Tool callers may omit the redundant query: only the loaded record supplies
+  // it. A provided mismatching (or malformed) query is never silently replaced.
+  const query = text(Object.hasOwn(value, "originalQuery") ? value.originalQuery : originalQuery,
+    "originalQuery", GROUNDING_CONSTRAINT_LIMITS.queryCharacters, true, true);
   let serialized: string;
   try {
-    serialized = JSON.stringify(value);
+    serialized = JSON.stringify({ ...value, originalQuery: query });
   } catch {
     throw new Error("Grounding contract must be JSON-serializable.");
   }
   if (new TextEncoder().encode(serialized).byteLength > GROUNDING_CONSTRAINT_LIMITS.serializedBytes) {
     throw new Error(`Grounding contract exceeds the ${GROUNDING_CONSTRAINT_LIMITS.serializedBytes}-byte serialized UTF-8 limit. Shorten evidence, excerpts or candidate declarations; preserve originalQuery exactly and keep unresolved gaps explicit.`);
   }
-  const query = text(value.originalQuery, "originalQuery", GROUNDING_CONSTRAINT_LIMITS.queryCharacters, true, true);
   if (originalQuery !== undefined && query !== originalQuery) {
     throw new Error("Grounding contract originalQuery must exactly match the loaded original query; preserve every word and ambiguity.");
   }
@@ -315,7 +323,7 @@ export function assessGroundingConstraints(
     "Pixel measurements, magnification and repeated same-source-pixel views do not establish identity or resolve query ambiguity. Human review is always required.",
   ];
   if (!contract) {
-    issue("missing_contract", "No original-query contract is recorded. A legacy notebook cannot establish a new locked selection; submit unresolved for human review or record the missing evidence.");
+    issue("missing_contract", "No original-query contract is recorded. Attach contract directly to the save call (or state.contract to grounding_evidence); originalQuery may be omitted and will use the loaded query. Keep requirements[].queryText as exact query excerpts. No extra image call is needed; unsupported claims remain unresolved for human review.");
     return { status: "unresolved", canLock: false, requiresHumanReview: true, issues, orders, limitations };
   }
   // Revalidate callers using persisted or plain JavaScript data, without ever

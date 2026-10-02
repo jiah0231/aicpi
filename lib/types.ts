@@ -141,6 +141,12 @@ export interface GroundingReviewImage {
   width?: number;
   height?: number;
 }
+export interface GroundingReviewBoundaryPreview {
+  /** Clean visible-image pixels cropped by the runtime, without a baked-in box. */
+  image: GroundingReviewImage;
+  /** Actual crop edges [x1, y1, x2, y2], normalized to the full source image. */
+  region: [number, number, number, number];
+}
 export type GroundingReviewStatus = "ok" | "low_confidence" | "unresolved";
 export type GroundingLearningCategory =
   | "identity"
@@ -185,6 +191,7 @@ export interface GroundingReviewDetails {
   expectedOrdinal?: number;
   reason: string;
   image: GroundingReviewImage;
+  boundaryPreview?: GroundingReviewBoundaryPreview;
   availableModalities: Array<"visible" | "infrared" | "depth">;
   canContinue?: boolean;
   expiresAt?: number;
