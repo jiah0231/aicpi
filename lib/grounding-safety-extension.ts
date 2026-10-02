@@ -21,6 +21,13 @@ import { buildGroundingComparison, GroundingViewRegistry, type GroundingViewDesc
 import { compactGroundingEvidence, validateGroundingWorkingState, type GroundingWorkingState } from "./grounding-evidence";
 import { assessGroundingConstraints, validateGroundingConstraintContract, GROUNDING_CONSTRAINT_LIMITS,
   type GroundingConstraintContract, type GroundingConstraintAssessment } from "./grounding-constraints";
+import { applyGroundingPromptOptions } from "./grounding-prompt";
+import {
+  GROUNDING_REQUEST_DIAGNOSTICS_ENTRY,
+  groundingRequestControls,
+  hasGroundingRequestDiagnosticsMarker,
+  stripGroundingRequestDiagnosticsMarker,
+} from "./grounding-request-diagnostics";
 
 const EXTENSION_NAME = "pi-web-grounding-safety";
 const GROUNDING_SECTION = "grounding_runtime_safety";
@@ -182,8 +189,6 @@ type LoadedBatchRecord = {
   views: GroundingViewRegistry;
   pinnedViewIds: Set<string>;
   archivedViewIds: Set<string>;
-  evidenceRevision: number;
-  lastRedundantViewRevision?: number;
   workingState?: GroundingWorkingState;
 };
 
@@ -318,6 +323,7 @@ type GroundingViewDetails = ReturnType<typeof groundingTargetReminder> & {
   currentBbox: [number, number, number, number] | null;
   modality: GroundingModality;
   reason: string;
+  inputCoordinateSpace?: "source" | "source_pixels" | "view_pixels" | "view_normalized";
   image: GroundingImage["details"];
   viewId?: string;
   sourceReuse?: ReturnType<GroundingViewRegistry["sourceReuse"]>;
@@ -336,7 +342,6 @@ function recordEvidence() {
     views: new GroundingViewRegistry(),
     pinnedViewIds: new Set<string>(),
     archivedViewIds: new Set<string>(),
-    evidenceRevision: 0,
   };
 }
 
@@ -344,24 +349,11 @@ function registerGroundingView(
   loaded: LoadedBatchRecord,
   image: GroundingImage,
   decorations: GroundingViewDescriptor["decorations"],
-  enforceReuseCheckpoint = false,
 ) {
   const { originalWidth: sourceWidth, originalHeight: sourceHeight, width, height, modality } = image.details;
   if (!sourceWidth || !sourceHeight || !width || !height) throw new Error("The view is missing source/display dimensions.");
   const input = { modality, region: image.details.cropNormalized ?? [0, 0, 1, 1] as [number, number, number, number], sourceWidth, sourceHeight, width, height, decorations };
   const sourceReuse = loaded.views.sourceReuse(input);
-  const priorReuseView = sourceReuse ? loaded.views.get(sourceReuse.previousViewId) : undefined;
-  const priorIsOverview = priorReuseView?.region.every((edge, index) => edge === [0, 0, 1, 1][index]) === true;
-  const inputIsOverview = input.region.every((edge, index) => edge === [0, 0, 1, 1][index]);
-  if (enforceReuseCheckpoint && sourceReuse && (!priorIsOverview || inputIsOverview)) {
-    if (loaded.lastRedundantViewRevision === loaded.evidenceRevision) {
-      throw new Error(
-        "This region substantially reuses source pixels already inspected since the last evidence checkpoint. "
-        + "Use the existing view, save the selected target, or update grounding_evidence with the concrete unresolved question and new visible contradiction before another rerender.",
-      );
-    }
-    loaded.lastRedundantViewRevision = loaded.evidenceRevision;
-  }
   const equivalent = loaded.views.findEquivalent(input);
   const view = loaded.views.register(input);
   // Keep dimensions alongside the image, not just in UI-only tool details.
@@ -416,7 +408,7 @@ function isFilesystemTraversalCommand(value: string): boolean {
 }
 
 function isGroundingPrompt(prompt: string): boolean {
-  return GROUNDING_PROMPT.test(prompt);
+  return GROUNDING_PROMPT.test(stripGroundingRequestDiagnosticsMarker(prompt));
 }
 
 function groundingEntryText(entry: unknown): string {
@@ -448,6 +440,33 @@ export function requestedBatchCount(prompt: string): number | undefined {
     if (Number.isSafeInteger(count) && count > 0) return count;
   }
   return undefined;
+}
+
+/** Recovery is opt-in for this user turn, never inherited from a persisted job. */
+function groundingTurnRequestsWork(prompt: string): boolean {
+  // Dataset paths often contain words such as "review", "status", or "stop";
+  // those are data, not instructions about this turn's purpose.
+  const instructions = prompt.replace(/["'`](?:[A-Za-z]:[\\/]|\\\\|\/)[^"'`\r\n]*["'`]|(?:[A-Za-z]:[\\/]|\\\\|\/)[^\s，。；!?]*/gu, " ");
+  // Explicit withdrawal wins over a mention of the old dataset or its actions.
+  // Keep English and Chinese requests, negation, and informational clauses
+  // separate: a bare "continue" must not turn "continue explaining" into work.
+  const withdrawn = /\b(?:do\s+not|don['’]t|never|without)\s+(?:(?:automatically|auto|further|again)\s+)*(?:annotat\w*|label\w*|ground\w*|process\w*|resume|continue|start|begin|advance|save|submit)\b/iu
+    .test(instructions)
+    || /\bno\s+(?:more\s+|further\s+)?(?:annotations?|labeling|grounding|processing|continuation)\b/iu.test(instructions)
+    || /(?:不要|别|无需|不用|禁止|暂不|先不|不再|不做|不进行)\s*(?:再|自动|继续|开始|进行)?\s*(?:标注|处理|定位|画框|框选|保存|提交|继续|重启|恢复|运行|批处理)/u.test(instructions)
+    || /\b(?:stop|pause|cancel|halt)\s+(?:(?:the|this|current|remaining)\s+)*(?:annotat\w*|label\w*|ground\w*|dataset|batch|run|processing|task|job)\b/iu.test(instructions)
+    || /(?:停止|暂停|取消)\s*(?:当前|这个|本次|这次|继续|自动)?\s*(?:标注|处理|定位|画框|任务|批次|运行)/u.test(instructions);
+  if (withdrawn) return false;
+  const clauses = instructions.split(/[。！？!?；;\n，,]|\.(?:\s|$)|\s+(?:and(?:\s+then)?|then|but)\s+|然后|并且|并|接着/iu);
+  if (clauses.some((clause) => /^\s*(?:(?:please\s+)?(?:stop|pause|cancel|halt)(?:\s+(?:now|here|please|it))?|(?:请|先)?(?:停|停止|暂停|取消)(?:一下|吧|了)?)\s*$/iu.test(clause))) return false;
+  return clauses.some((clause) => {
+    if (/(?:分析|解释|说明|复盘|总结|讨论|状态|进度|原因|为什么|怎么|如何|grounding_status)|\b(?:explain\w*|analy[sz]\w*|describ\w*|discuss\w*|summari[sz]\w*|summary|status|progress|inspect|audit|review|report|list|check|why|how|what|when)\b/iu.test(clause)) return false;
+    return requestedBatchCount(clause) !== undefined
+      || /\b(?:annotate|label|ground)\b|(?:批处理|标注|框出|画框|圈出|框选|图像定位|重新定位|纠偏|返修|重新核对)/iu.test(clause)
+      || /\b(?:locate|draw|correct|revise|reopen|fix|submit|process|continue|resume|proceed|next)\b.{0,48}\b(?:box|bbox|records?|items?|query|queries|image|dataset|batch|target|annotat\w*|grounding|candidate)\b|(?:修正|改正|纠正|处理|核对|定位|继续|接着|恢复).{0,20}(?:框|目标|对象|图像|图片|数据|记录|样本|标注|批次)/iu.test(clause)
+      || /^\s*(?:(?:please\s+)?(?:continue|resume|proceed|next|carry\s+on|go\s+on)(?:\s+(?:please|now|it))?|(?:请)?(?:继续|接着|下一条|接下来)(?:吧)?)\s*$/iu.test(clause)
+      || /\b(?:box|bbox)\b.{0,24}\b(?:wrong|incorrect)\b|框不对|框错|框.{0,8}(?:不准|错误)/iu.test(clause);
+  });
 }
 
 function allowedRecord(record: unknown): Record<string, string> | null {
@@ -700,6 +719,30 @@ function validateBoundingBox(value: readonly number[]): [number, number, number,
     throw new Error("bbox must contain four finite normalized values with x1 < x2 and y1 < y2.");
   }
   return [value[0], value[1], value[2], value[3]];
+}
+type GroundingViewCoordinateSpace = "source" | "source_pixels" | "view_pixels" | "view_normalized";
+
+function looksLikePixelBox(value: readonly number[]): boolean {
+  return value.length === 4 && value.every((coordinate) => Number.isSafeInteger(coordinate) && coordinate >= 0)
+    && value.some((coordinate) => coordinate > 1);
+}
+
+function sourcePixelsToNormalized(
+  value: readonly number[],
+  sourceWidth: number,
+  sourceHeight: number,
+): [number, number, number, number] {
+  if (!looksLikePixelBox(value)
+    || value[0] >= value[2] || value[1] >= value[3]
+    || value[2] > sourceWidth || value[3] > sourceHeight) {
+    throw new Error("source_pixels region must contain four integer source-image edges within the current modality.");
+  }
+  return validateBoundingBox([
+    value[0] / sourceWidth,
+    value[1] / sourceHeight,
+    value[2] / sourceWidth,
+    value[3] / sourceHeight,
+  ]);
 }
 // Legacy UI hint only, never a query interpreter. Multiple distinct ordinal
 // tokens have no single safe default (e.g. "second first"). New contracts keep
@@ -1545,6 +1588,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       let continuationNudges = 0;
       let savingRecord = false;
       let reviewInterrupted = false;
+      let settleRecoveryAllowed = false;
+      let requestDiagnosticsEnabled = false;
       let lastJob: { queryPath: string; outputDir: string } | undefined;
       let jobStartCompleted: number | undefined;
       let requestedCountPending = false;
@@ -2017,9 +2062,13 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           throw error;
         }
         if (review.action === "reject") {
+          reviewInterrupted = true;
           throw new Error(`Browser grounding review rejected candidate: ${review.reason}. Revise this same record and request review again; do not load the next record.`);
         }
         signal?.throwIfAborted();
+        // A later, explicitly approved correction clears the rejection barrier;
+        // subsequent records retain their own bounded recovery allowance.
+        reviewInterrupted = false;
         const bbox = review.bbox;
         loaded.currentBbox = bbox;
         // Persist the review identity before the ledger write. After a crash,
@@ -2363,7 +2412,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         description: "Keep a short evidence state and choose which views remain in model context. Separate direct visible facts from unverified identity/part hypotheses. Pin useful views, archive superseded images, or restore them; full transcript and user corrections are never deleted.",
         promptGuidelines: [
           "facts must contain only direct visible observations. Put interpretations such as 'this dark line is the beak' in hypotheses until structural evidence verifies the object and part. A color match alone never promotes a hypothesis to a fact.",
-          "Keep the original query and the user's target requirements intact in state.target; put changing candidate identities in hypotheses, not in place of the requested target. Record hypotheses, open questions and ruled-out candidates concisely, not private deliberation. Before another substantially overlapping view, state what remains unresolved and what visible result would confirm or reject the hypothesis.",
+          "Keep the original query and the user's target requirements intact in state.target; put changing candidate identities in hypotheses, not in place of the requested target. Record hypotheses, open questions and ruled-out candidates concisely, not private deliberation. An evidence update is not required for every crop; use another view only for a concrete unresolved question.",
+          "state is a partial update: omitted fields, including selection and contract, are preserved. Supplied arrays replace their previous values; use [] to clear a list. Supply a complete selection with status and evidence to change the target lock.",
           "Before locking or submitting, record state.contract: exact originalQuery, queryCoverage, all plausible interpretations and their requirements tied to verbatim queryText, candidate IDs/source boxes and identity evidence. Keep unclear or conflicting readings separately, for example first vs second in 'second first'; never silently pick one. A queryCoverage claim is your evidence declaration, not a machine proof.",
           "For ordered targets each interpretation declares spatialOrder axis (x/y), direction (ascending is left-to-right/top-to-bottom, descending the reverse), ordinal and candidateIds. Keep the total serialized contract at most 32 KiB and queryText excerpts at most 600 characters; shorten evidence, never the original query. The runtime sorts source centers independently of discovery/array order. Declare candidateSet unresolved if membership/count is uncertain. Identity basis is visual_structure only for actual visible structure; repeated_view/pixel_measurement cannot prove identity. Alternatives rejected by evidence stay as contradicted interpretations.",
           "Missing or unresolved contracts stay reviewable as unresolved at low confidence; no extra color/crop call is required. Unsupported locks are returned as reconsidering with explicit constraintAssessment issues. Fix only what current evidence supports; never fabricate evidence to clear a check.",
@@ -2393,7 +2443,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         executionMode: "sequential",
         async execute(_id, params) {
           const [key, loaded] = resolveLoadedRecord(params);
-          let state = params.state === undefined ? loaded.workingState : validateGroundingWorkingState(params.state);
+          const patch = params.state === undefined ? undefined : validateGroundingWorkingState(params.state);
+          let state = patch === undefined ? loaded.workingState : { ...loaded.workingState, ...patch };
           if (state?.contract) validateGroundingConstraintContract(state.contract, loaded.record.query ?? "");
           const constraintAssessment = assessOriginalQueryConstraints(state?.contract, loaded.record.query ?? "", state?.selection?.bbox);
           const lockDeferred = state?.selection?.status === "locked" && !constraintAssessment.canLock;
@@ -2408,10 +2459,12 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           for (const id of params.restore ?? []) loaded.archivedViewIds.delete(id);
           for (const id of params.pin ?? []) loaded.pinnedViewIds.add(id);
           loaded.workingState = state;
-          if (params.state !== undefined) loaded.evidenceRevision += 1;
-          if (state?.selection?.bbox) {
+          // Updating notes or listing views must not erase the target lock or
+          // replace a measured hypothesis with the lock's earlier rough bounds.
+          // A lock deferred by the constraint assessment reopens selection.
+          if (patch?.selection && state?.selection?.status === "locked" && state.selection.bbox) {
             loaded.currentBbox = [...state.selection.bbox];
-          } else if (state?.selection?.status === "reconsidering") {
+          } else if (patch?.selection && state?.selection?.status === "reconsidering") {
             loaded.currentBbox = undefined;
           }
           persistJob();
@@ -2484,7 +2537,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const repeatedPanels = panels.filter((panel) => panel.sourceReuse);
           const details = { key, ...groundingTargetReminder(loaded), modality, reason: params.reason, overview: overviewView, panels,
             evidenceViewIds: [overviewView.id, ...panels.map((view) => view.id)],
-            ...(repeatedPanels.length ? { decisionCheckpoint: `${repeatedPanels.length} comparison panel(s) substantially reuse prior source pixels. Record what changed before repeating the same identity comparison.` } : {}),
+            ...(repeatedPanels.length ? { decisionCheckpoint: `${repeatedPanels.length} comparison panel(s) substantially reuse prior source pixels. Reuse the prior comparison unless a concrete identity or order question remains unresolved.` } : {}),
             note: "Use one panel's viewId. view_pixels and view_normalized refer to this WHOLE comparison canvas; the box must lie inside that panel's displayRect. Source coordinates use coordinateSpace source. Panels may have different display scales." };
           return { content: [{ type: "text" as const, text: JSON.stringify(details) },
             { type: "image" as const, data: encodedComparison.data, mimeType: encodedComparison.mimeType }], details };
@@ -2505,8 +2558,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Use one or more focus crops when the target is small, ambiguous, or needs closer inspection. You decide whether to crop, how many crops to request, and the zoom for each crop. The runtime does not force a crop before saving.",
           "Do not tile the image to rule out merely hypothetical hidden candidates. For an ordinal query, use the overview as the common ordering frame; once enough visible candidates establish the requested rank, record state.selection and stop inspecting candidates that cannot change that rank.",
           "After state.selection is locked, further crops must intersect that candidate and answer a boundary or requested-part question. To switch candidates, first set selection to reconsidering in grounding_evidence and name the new visible counterevidence; uncertainty by itself is not a reason to restart the search.",
-          "To recall the same region, use viewId without region. To crop within that displayed view, provide viewId + region + coordinateSpace view_normalized or view_pixels. For a new full-source region omit viewId, or explicitly use coordinateSpace source. Never assume crop-local numbers are source coordinates.",
-          "For a box read from this display, use its viewId and coordinateSpace view_pixels or view_normalized. Source grid numbers already use source coordinates. last_crop is legacy and refers only to the latest crop.",
+          "To recall the same region, use viewId without region. To crop within that displayed view, provide viewId + region + coordinateSpace view_normalized or view_pixels. For a new full-source region omit viewId and use source-normalized coordinates or source_pixels. Bare integer regions outside 0..1 are recovered as pixels only when the frame is unambiguous; prefer an explicit coordinateSpace. Never assume crop-local numbers are source coordinates.",
+          "For a box read from this display, use its viewId and coordinateSpace view_pixels or view_normalized when saving. Source grid numbers already use source coordinates. last_crop is legacy and refers only to the latest crop.",
           "When repeatedSourceViewId is returned, these source pixels were already examined; explain what new question another rendering answers. Use grounding_compare for identity ambiguity and grounding_evidence to retain facts and archive redundant views, without a fixed crop count.",
           "A crop that reaches the source image border reports touchesSourceEdge, which means no margin exists on that side; do not assume hidden context beyond the reported crop span.",
         ],
@@ -2514,8 +2567,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           queryPath: Type.Optional(Type.String({ description: "Source queries.json; defaults to the loaded record's dataset" })),
           key: Type.Optional(Type.String({ description: "Record key; defaults to the currently loaded record" })),
           modality: Type.Optional(Type.String({ description: "visible (default), infrared, or depth" })),
-          viewId: Type.Optional(Type.String({ description: "Without region, recall this view. With region, coordinateSpace must explicitly say source, view_normalized or view_pixels. The new display receives a fresh viewId." })),
-          coordinateSpace: Type.Optional(Type.Union([Type.Literal("source"), Type.Literal("view_normalized"), Type.Literal("view_pixels")], { description: "Coordinate frame for region only; bbox always stays source-normalized. Required when viewId and region are both supplied." })),
+          viewId: Type.Optional(Type.String({ description: "Without region, recall this view. With region, use view_normalized or view_pixels. A fresh viewId describes the newly rendered display." })),
           decorations: Type.Optional(Type.Union([Type.Literal("none"), Type.Literal("grid"), Type.Literal("hypothesis"), Type.Literal("all")])),
           bbox: Type.Optional(Type.Array(Type.Number(), {
             minItems: 4,
@@ -2526,8 +2578,11 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           region: Type.Optional(Type.Array(Type.Number(), {
             minItems: 4,
             maxItems: 4,
-            description: "Crop [x1,y1,x2,y2] in source coordinates by default. With viewId, explicitly declare coordinateSpace; view coordinates are mapped automatically. May inspect only a small part of bbox.",
+            description: "Crop [x1,y1,x2,y2] in coordinateSpace; source-normalized by default. May inspect only a small part of bbox. The current hypothesis remains in full source coordinates.",
           })),
+          coordinateSpace: Type.Optional(Type.Union([
+            Type.Literal("source"), Type.Literal("source_pixels"), Type.Literal("view_pixels"), Type.Literal("view_normalized"),
+          ], { description: "Region coordinates: source-normalized by default, source pixels, or coordinates on viewId." })),
           reason: Type.String({ description: "Concrete reason this additional view is needed" }),
         }),
         executionMode: "sequential",
@@ -2537,12 +2592,6 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const targetReminder = groundingTargetReminder(loaded);
           const recalled = params.viewId ? loaded.views.get(params.viewId) : undefined;
           if (params.viewId && !recalled) throw new Error("Unknown or stale viewId. List current record views with grounding_evidence, or request a new region.");
-          if (recalled && params.region && !params.coordinateSpace) {
-            throw new Error("viewId + region needs an explicit coordinateSpace. Retry with coordinateSpace view_normalized (0..1 on the displayed view), view_pixels (display pixels), or source (full-image normalized). To recall the unchanged view, omit region. bbox always uses source coordinates.");
-          }
-          if (params.coordinateSpace && params.coordinateSpace !== "source" && (!recalled || !params.region)) {
-            throw new Error("view_normalized/view_pixels requires both viewId and region. For an unchanged recall use only viewId; for a source crop use region and zoom.");
-          }
           if (recalled && params.modality && params.modality !== recalled.modality) throw new Error("The requested modality does not match this viewId.");
           const modality = recalled?.modality ?? params.modality ?? "visible";
           if (!(modality === "visible" || modality === "infrared" || modality === "depth")) {
@@ -2564,10 +2613,35 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const { sourcePath } = await loadQueryState(params.queryPath ?? loaded.sourcePath);
           if (loaded.sourcePath !== sourcePath) throw new Error("The requested queryPath does not match the loaded record.");
 
-          const mappedRegion = params.region && recalled && params.coordinateSpace && params.coordinateSpace !== "source"
-            ? loaded.views.toSource(recalled.id, params.region, params.coordinateSpace)
-            : params.region;
-          const requestedRegion = mappedRegion ?? (recalled && !recalled.region.every((value, index) => value === [0, 0, 1, 1][index]) ? recalled.region : undefined);
+          let inputCoordinateSpace = params.coordinateSpace as GroundingViewCoordinateSpace | undefined;
+          let requestedRegion: [number, number, number, number] | undefined;
+          if (params.region) {
+            if (!inputCoordinateSpace && looksLikePixelBox(params.region)) {
+              inputCoordinateSpace = recalled ? "view_pixels" : "source_pixels";
+            }
+            inputCoordinateSpace ??= "source";
+            if (inputCoordinateSpace === "view_pixels" || inputCoordinateSpace === "view_normalized") {
+              if (!recalled) throw new Error(`${inputCoordinateSpace} region requires a current-record viewId.`);
+              requestedRegion = loaded.views.toSource(recalled.id, params.region, inputCoordinateSpace);
+            } else if (inputCoordinateSpace === "source_pixels") {
+              if (recalled) {
+                throw new Error("With viewId, use view_pixels or view_normalized; source_pixels does not refer to the display canvas.");
+              }
+              const sourceView = loaded.views.list().find((view) => view.modality === modality);
+              if (!sourceView) throw new Error("source_pixels requires an existing view of this modality so its source dimensions are known.");
+              requestedRegion = sourcePixelsToNormalized(params.region, sourceView.sourceWidth, sourceView.sourceHeight);
+            } else if (inputCoordinateSpace === "source") {
+              if (recalled && params.coordinateSpace === undefined) {
+                throw new Error("A normalized region is ambiguous with viewId. Omit viewId, or use an explicit coordinateSpace of source, view_pixels, or view_normalized.");
+              }
+              requestedRegion = validateBoundingBox(params.region);
+            }
+          } else {
+            if (params.coordinateSpace) throw new Error("coordinateSpace is only used with region.");
+            requestedRegion = recalled && !recalled.region.every((value, index) => value === [0, 0, 1, 1][index])
+              ? recalled.region
+              : undefined;
+          }
           if (selected && !requestedRegion && modality === "visible" && loaded.grantedModalities.has("visible")) {
             throw new Error(
               "The visible overview is already available and the target is selected. Inspect a crop intersecting that target or submit it for review.",
@@ -2585,7 +2659,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
               );
             }
             const image = await loadGroundingCrop(sourcePath, loaded.record, modality, region, currentBbox, readRecordImage, zoom, decorations);
-            const view = registerGroundingView(loaded, image, decorations, true);
+            const view = registerGroundingView(loaded, image, decorations);
             if (overview) {
               const overviewView = registerGroundingView(loaded, overview, "none");
               loaded.pinnedViewIds.add(overviewView.id);
@@ -2601,6 +2675,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
               currentBbox,
               modality,
               reason: params.reason,
+              ...(inputCoordinateSpace ? { inputCoordinateSpace } : {}),
               image: image.details,
               viewId: view.id,
               ...(view.sourceReuse ? { sourceReuse: view.sourceReuse } : {}),
@@ -2611,8 +2686,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             return {
               content: [
                 { type: "text" as const, text: JSON.stringify({ key, ...targetReminder, focused: modality, currentBbox, viewId: view.id, requestedZoom: zoom,
-                  reason: params.reason, ...(view.sourceReuse ? { sourceReuse: view.sourceReuse,
-                    decisionCheckpoint: "This rendering mostly reuses prior source pixels. State the unresolved question and update grounding_evidence before requesting another overlapping view." } : {}) }) },
+                  reason: params.reason, ...(inputCoordinateSpace ? { inputCoordinateSpace } : {}), ...(view.sourceReuse ? { sourceReuse: view.sourceReuse,
+                    decisionCheckpoint: "This rendering mostly reuses prior source pixels. Reuse the existing view when sufficient; another crop may resolve a distinct boundary or part question without an extra evidence checkpoint." } : {}) }) },
                 ...(overview?.content ?? []),
                 ...image.content,
               ],
@@ -2644,7 +2719,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             content: [
               { type: "text" as const, text: JSON.stringify({ key, ...targetReminder, viewed: modality, currentBbox, viewId: view.id, reason: params.reason,
                 ...(view.sourceReuse ? { sourceReuse: view.sourceReuse,
-                  decisionCheckpoint: "This rendering mostly reuses prior source pixels. State the unresolved question and update grounding_evidence before requesting another overlapping view." } : {}) }) },
+                  decisionCheckpoint: "This rendering mostly reuses prior source pixels. Reuse the existing view when sufficient; another crop may resolve a distinct boundary or part question without an extra evidence checkpoint." } : {}) }) },
               ...image.content,
             ],
             details,
@@ -2760,7 +2835,18 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       });
 
       pi.on("agent_before_settle", (event) => {
-        if (!active || !batchMode || savingRecord || reviewInterrupted || event.outcome !== "completed" || !event.context.canContinue) return undefined;
+        if (!active || !batchMode || !settleRecoveryAllowed || savingRecord || reviewInterrupted || event.outcome !== "completed") return undefined;
+        // In pi 0.87 an assistant-tail context (including stopReason="length")
+        // has canContinue=false. Our custom_message supplies the next user-role
+        // input, and the SDK validates continuation again after committing it.
+        // Do not compete with already queued user input or another extension's
+        // continuation, and do not consume the one-shot allowance while waiting.
+        if (event.continue || event.context.pendingMessages?.length) return undefined;
+        const lastAssistant = event.context.contextMessages?.findLast((message) => message.role === "assistant");
+        if (lastAssistant?.role === "assistant" && ["aborted", "error"].includes(lastAssistant.stopReason)) return undefined;
+        const outputLimitCue = lastAssistant?.role === "assistant" && lastAssistant.stopReason === "length"
+          ? "The previous response reached the model output limit. Keep this recovery brief: reuse the existing evidence and avoid repeating analysis or rerendering the same pixels. "
+          : "";
         const current = loadedBatchRecords.entries().next().value as [string, LoadedBatchRecord] | undefined;
         if (!current) {
           if (jobRestoreWarning) return undefined;
@@ -2774,11 +2860,11 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             if (startupNudges >= 1) return undefined;
             startupNudges += 1;
             return {
-              entries: [{
+              entries: [...(event.entries ?? []), {
                 type: "custom_message" as const,
                 customType: "grounding-required-start",
                 display: false,
-              content: "The requested dataset run has not started. Do not end the turn. Call grounding_next_batch exactly once now; do not read queries.json or enumerate files.",
+                content: outputLimitCue + "The requested dataset run has not started. Call grounding_next_batch exactly once now; do not read queries.json or enumerate files.",
               }],
               continue: true,
             };
@@ -2791,11 +2877,11 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           ) return undefined;
           continuationNudges += 1;
           return {
-            entries: [{
+            entries: [...(event.entries ?? []), {
               type: "custom_message" as const,
               customType: "grounding-required-next",
               display: false,
-              content: `Only ${sessionSavedCount} of the requested ${requestedRecordLimit} records have been saved in this run. `
+              content: outputLimitCue + `Only ${sessionSavedCount} of the requested ${requestedRecordLimit} records have been saved in this run. `
                 + "Do not end yet. Call grounding_next_batch once to load the next unfinished record.",
             }],
             continue: true,
@@ -2805,19 +2891,27 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         if (loaded.settleNudges >= 1) return undefined;
         loaded.settleNudges += 1;
         return {
-          entries: [{
+          entries: [...(event.entries ?? []), {
             type: "custom_message" as const,
             customType: "grounding-required-save",
             display: false,
-            content: `Grounding record ${key} is still unsaved. Do not end the turn. `
+            content: outputLimitCue + `Grounding record ${key} is still unsaved. `
               + `Original query: ${JSON.stringify(loaded.record.query ?? "")}. `
-              + "Use the image already in context and reconcile the best-supported single normalized bbox with all original query requirements before calling grounding_save_result or grounding_save_and_next. If a required condition remains unestablished, submit it as unresolved with low confidence and explain what is missing.",
+              + "Use the image already in context and reconcile the best-supported single normalized bbox with all original query requirements before calling grounding_save_result or grounding_save_and_next for human review. If a required condition remains unestablished, submit it as unresolved with low confidence and explain what is missing; do not invent certainty to finish.",
           }],
           continue: true,
         };
       });
 
+      pi.on("before_provider_request", (event, ctx) => {
+        if (!requestDiagnosticsEnabled || !active || !batchMode) return;
+        pi.appendEntry(GROUNDING_REQUEST_DIAGNOSTICS_ENTRY, groundingRequestControls(ctx.model, event.payload));
+        // No return value: the SDK must send the original, unmodified payload.
+      });
+
       pi.on("session_start", async (_event, ctx) => {
+        settleRecoveryAllowed = false;
+        requestDiagnosticsEnabled = false;
         const entries = ctx.sessionManager.getEntries();
         const previousPromptTexts = entries.map(groundingEntryText);
         const hasPersistedJob = entries.some((entry) => entry.type === "custom" && entry.customType === "grounding:job"
@@ -2888,16 +2982,20 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       });
 
       pi.on("before_agent_start", async (event) => {
+        // User-turn opt-in only: no inheritance from an earlier run or restore.
+        requestDiagnosticsEnabled = hasGroundingRequestDiagnosticsMarker(event.prompt);
+        const prompt = stripGroundingRequestDiagnosticsMarker(event.prompt);
+        settleRecoveryAllowed = groundingTurnRequestsWork(prompt);
         reviewInterrupted = false;
-        if (isGroundingPrompt(event.prompt)) active = true;
-        const requestedCount = requestedBatchCount(event.prompt);
+        if (isGroundingPrompt(prompt)) active = true;
+        const requestedCount = settleRecoveryAllowed ? requestedBatchCount(prompt) : undefined;
         const currentRecord = loadedBatchRecords.values().next().value as LoadedBatchRecord | undefined;
         const hasPendingRecord = currentRecord !== undefined || persistedPending !== undefined;
         const adjustsRemainingCount = requestedCount !== undefined && hasPendingRecord
-          && /(?:只|仅|改为|改成|接下来|剩下|剩余)|\b(?:only|instead|remaining|next)\b/i.test(event.prompt);
+          && /(?:只|仅|改为|改成|接下来|剩下|剩余)|\b(?:only|instead|remaining|next)\b/i.test(prompt);
         if (
-          /批处理/i.test(event.prompt)
-          || (/queries?\.json/i.test(event.prompt) && /(?:visible|infrared|depth|处理|定位|全部|所有|全量)/i.test(event.prompt))
+          /批处理/i.test(prompt)
+          || (/queries?\.json/i.test(prompt) && /(?:visible|infrared|depth|处理|定位|全部|所有|全量)/i.test(prompt))
         ) batchMode = true;
         if (requestedCount !== undefined && (!hasPendingRecord || adjustsRemainingCount)) {
           batchMode = true;
@@ -2917,6 +3015,11 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         }
         if (!active) return;
         setGroundingToolsActive(true);
+        if (batchMode && applyGroundingPromptOptions(event.systemPromptOptions, [
+          "Runtime grounding safety is active.",
+          lastJob ? `Current dataset: ${lastJob.queryPath}. Current output directory: ${lastJob.outputDir}.` : "",
+          `Job state: ${JSON.stringify(jobSnapshot())}.`,
+        ].filter(Boolean).join("\n"))) return;
         event.systemPromptOptions.sections[GROUNDING_SECTION] = [
           "Runtime grounding safety is active.",
           lastJob ? `Current dataset: ${lastJob.queryPath}. Current output directory: ${lastJob.outputDir}.` : "",
