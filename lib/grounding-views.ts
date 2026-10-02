@@ -278,13 +278,13 @@ export type GroundingOverviewAnnotation = {
 };
 
 /** Geometry of declared object boxes only; an inspection ROI is not an object. */
-export function groundingCandidateGeometry(candidates: Array<{ region: GroundingViewBox; bbox?: GroundingViewBox }>, sourceWidth: number, sourceHeight: number) {
+export function groundingCandidateGeometry(candidates: Array<{ id?: string; region: GroundingViewBox; bbox?: GroundingViewBox }>, sourceWidth: number, sourceHeight: number) {
   positiveDimension(sourceWidth, "sourceWidth");
   positiveDimension(sourceHeight, "sourceHeight");
   const items = candidates.map((candidate, index) => {
     validBox(candidate.region, "region");
     contained(candidate.region, [0, 0, 1, 1], "region");
-    const id = String.fromCharCode(65 + index);
+    const id = candidate.id ?? String.fromCharCode(65 + index);
     if (!candidate.bbox) return { id, region: candidate.region };
     validBox(candidate.bbox, "bbox");
     contained(candidate.bbox, [0, 0, 1, 1], "bbox");
@@ -331,6 +331,7 @@ export async function buildGroundingComparison(
   overview: Buffer,
   candidates: Array<{ label: string; image: Buffer; edgeMarker?: { axis: "x" | "y"; fraction: number } }>,
   annotations: GroundingOverviewAnnotation[] = [],
+  overviewLabel = "Overview",
 ): Promise<GroundingComparison> {
   if (candidates.length < 1 || candidates.length > 4) throw new Error("A comparison accepts 1 to 4 candidates per call; request another comparison for more candidates.");
   const width = 1600;
@@ -358,7 +359,7 @@ export async function buildGroundingComparison(
     return [imageLeft, imageTop, imageLeft + resized.info.width, imageTop + resized.info.height];
   }
 
-  const overviewRect = await addPanel(overview, "Overview", padding, padding, width - padding * 2, overviewHeight, false);
+  const overviewRect = await addPanel(overview, overviewLabel, padding, padding, width - padding * 2, overviewHeight, false);
   if (annotations.length > 8) throw new Error("At most 8 overview annotations are supported.");
   const annotationSvg = annotations.map((annotation) => {
     validBox(annotation.region, "overview annotation");

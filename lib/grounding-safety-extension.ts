@@ -20,7 +20,7 @@ import { analyzeGroundingColor } from "./grounding-color";
 import { proposeGroundingContours, validateGroundingContourOptions } from "./grounding-contours";
 import { processGroundingImage, validateGroundingImageOperations, type GroundingImageOperation } from "./grounding-image-processing";
 import { buildGroundingComparison, groundingCandidateGeometry, groundingBoundaryRegions, GroundingViewRegistry, type GroundingViewDescriptor } from "./grounding-views";
-import { compactGroundingEvidence, validateGroundingWorkingState, type GroundingWorkingState } from "./grounding-evidence";
+import { compactGroundingEvidence, validateGroundingWorkingState, GROUNDING_MAX_PINNED_VIEWS, type GroundingEvidenceImageBlock, type GroundingWorkingState } from "./grounding-evidence";
 import { assessGroundingConstraints, validateGroundingConstraintContract, GROUNDING_CONSTRAINT_LIMITS,
   type GroundingConstraintContract, type GroundingConstraintAssessment } from "./grounding-constraints";
 import { applyGroundingPromptOptions } from "./grounding-prompt";
@@ -67,11 +67,9 @@ const IMAGE_MAX_ZOOM = 12;
 // the SDK image resizer is unavailable. Original bytes are still used for
 // crops, color analysis and saved source coordinates.
 const GROUNDING_PREVIEW_MAX_BASE64_CHARS = 400_000;
-// Keep enough headroom for the system prompt, tool schemas and ordinary
-// conversation text on gateways with a roughly 1 MB request-body limit. The
-// transcript keeps every image; the context hook may omit older, unpinned
-// views from a provider request once their combined encoded size reaches this
-// budget.
+// Visual working-set allowance only, not a hard provider-body limit. Text,
+// schemas and provider serialization add bytes; required evidence can overflow
+// this allowance with an explicit warning. The transcript retains all pixels.
 const GROUNDING_CONTEXT_MAX_BASE64_CHARS = 800_000;
 const GROUNDING_PREVIEW_JPEG_QUALITIES = [82, 70, 58, 46, 38, 30] as const;
 const CROP_GRID_STEPS = [0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2] as const;
@@ -183,7 +181,7 @@ const groundingContractSchema = Type.Object({
       candidateIds: Type.Array(contractIdSchema, { maxItems: GROUNDING_CONSTRAINT_LIMITS.candidates }),
       selectedCandidateId: contractIdSchema, candidateSet: supportSchema,
     })),
-  }, { description: "A reading has id, reading, status, evidence and requirements. queryText belongs inside requirements[], not on the reading." }), { maxItems: GROUNDING_CONSTRAINT_LIMITS.interpretations }),
+  }, { description: "A reading has id, reading, status, evidence, requirements and optional spatialOrder. Put ordering at contract.interpretations[i].spatialOrder, never contract.spatialOrder or inside requirements. queryText belongs inside requirements[]." }), { maxItems: GROUNDING_CONSTRAINT_LIMITS.interpretations }),
   selectedCandidateId: Type.Optional(contractIdSchema),
 });
 
@@ -203,6 +201,7 @@ type LoadedBatchRecord = {
   humanApprovalId?: string;
   views: GroundingViewRegistry;
   pinnedViewIds: Set<string>;
+  overviewViewIds: Map<GroundingModality, string>;
   archivedViewIds: Set<string>;
   workingState?: GroundingWorkingState;
   processedPreview?: {
@@ -350,6 +349,7 @@ type GroundingViewDetails = ReturnType<typeof groundingTargetReminder> & {
   viewId?: string;
   sourceReuse?: ReturnType<GroundingViewRegistry["sourceReuse"]>;
   evidenceViewIds?: string[];
+  evidenceImageBlocks?: GroundingEvidenceImageBlock[];
 };
 
 function groundingTargetReminder(loaded: LoadedBatchRecord) {
@@ -363,8 +363,31 @@ function recordEvidence() {
   return {
     views: new GroundingViewRegistry(),
     pinnedViewIds: new Set<string>(),
+    overviewViewIds: new Map<GroundingModality, string>(),
     archivedViewIds: new Set<string>(),
   };
+}
+
+// At most three original overviews, three latest modalities and one candidate.
+// No image interpretation or synthesized visual facts are inferred here.
+function requiredEvidenceViews(loaded: LoadedBatchRecord): string[] {
+  const ids = new Set(loaded.overviewViewIds.values());
+  const latest = new Set<GroundingModality>();
+  const selected = loaded.workingState?.selection?.bbox ?? loaded.currentBbox;
+  let candidateFound = false;
+  for (const view of loaded.views.list().reverse()) {
+    if (loaded.archivedViewIds.has(view.id) && !loaded.pinnedViewIds.has(view.id)) continue;
+    if (!latest.has(view.modality)) { ids.add(view.id); latest.add(view.modality); }
+    if (!candidateFound && selected && view.modality === "visible" && !view.derived
+      && !view.region.every((edge, index) => edge === [0, 0, 1, 1][index])
+      && view.region[0] <= selected[0] && view.region[1] <= selected[1]
+      && view.region[2] >= selected[2] && view.region[3] >= selected[3]) {
+      ids.add(view.id);
+      candidateFound = true;
+    }
+    if (latest.size === 3 && (candidateFound || !selected)) break;
+  }
+  return [...ids];
 }
 
 function registerGroundingView(
@@ -618,6 +641,19 @@ export function compactCompletedGroundingContext(
       });
       continue;
     }
+    if (hasActiveRecord && index === boundary && message.role === "toolResult" && message.toolName === "grounding_save_and_next"
+      && message.details && typeof message.details === "object" && "completedRecordImageCount" in message.details
+      && typeof message.details.completedRecordImageCount === "number" && Number.isInteger(message.details.completedRecordImageCount)
+      && message.details.completedRecordImageCount > 0
+      && message.details.completedRecordImageCount < message.content.filter((block) => block.type === "image").length) {
+      // The immutable result includes approved-record previews for the UI.
+      // Only next-record pixels belong to the new model working set. Its block
+      // metadata is already indexed relative to these next-record images.
+      let previousImages = message.details.completedRecordImageCount;
+      const content = message.content.filter((block) => block.type !== "image" || previousImages-- <= 0);
+      compacted.push({ ...message, content, details: { ...message.details, completedRecordImageCount: 0 } });
+      continue;
+    }
     if (!hasActiveRecord && message.role === "toolResult") {
       const content = message.content.filter((block) => block.type !== "image");
       compacted.push({ ...message, content: content.length ? content : [{ type: "text", text: "Previous image omitted. Use grounding_reopen_record to inspect the saved record again." }] });
@@ -799,7 +835,7 @@ function sourcePixelsToNormalized(
 // Legacy UI hint only, never a query interpreter. Multiple distinct ordinal
 // tokens have no single safe default (e.g. "second first"). New contracts keep
 // the model's alternative readings explicitly instead of choosing one here.
-export function expectedGroundingOrdinal(query: string): number | undefined {
+function groundingOrdinalHints(query: string): number[] {
   const ordinals = new Set<number>();
   for (const match of query.matchAll(/第\s*(\d+)|\b(\d+)(?:st|nd|rd|th)\b/giu)) ordinals.add(Number(match[1] ?? match[2]));
   const words: Record<string, number> = { first: 1, second: 2, third: 3, fourth: 4, fifth: 5,
@@ -807,7 +843,11 @@ export function expectedGroundingOrdinal(query: string): number | undefined {
   for (const match of query.matchAll(/\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b/giu)) {
     ordinals.add(words[match[1].toLowerCase()]);
   }
-  return ordinals.size === 1 ? [...ordinals][0] : undefined;
+  return [...ordinals];
+}
+export function expectedGroundingOrdinal(query: string): number | undefined {
+  const ordinals = groundingOrdinalHints(query);
+  return ordinals.length === 1 ? ordinals[0] : undefined;
 }
 function assessOriginalQueryConstraints(
   contract: GroundingConstraintContract | undefined,
@@ -816,16 +856,16 @@ function assessOriginalQueryConstraints(
 ): GroundingConstraintAssessment {
   const assessment = assessGroundingConstraints(contract, originalQuery, bbox);
   const ordinalHint = expectedGroundingOrdinal(originalQuery);
-  if (!contract || ordinalHint === undefined) return assessment;
+  if (!contract || groundingOrdinalHints(originalQuery).length === 0) return assessment;
   // This narrow existing hint can catch an omitted/changed numeric constraint;
   // it does not parse direction, identity, or the meaning of ambiguous text.
   const plausible = contract.interpretations.filter((reading) => reading.status !== "contradicted");
   for (const reading of plausible) {
     const order = reading.spatialOrder;
-    if (order && order.ordinal === ordinalHint) continue;
+    if (order && (ordinalHint === undefined || order.ordinal === ordinalHint)) continue;
     assessment.issues.push({ code: order ? "original_ordinal_mismatch" : "missing_spatial_order",
       message: order ? `Original query contains the unambiguous ordinal hint ${ordinalHint}, but reading ${reading.id} declares ${order.ordinal}. Preserve the original requirement.`
-        : `Original query contains ordinal hint ${ordinalHint}, but reading ${reading.id} has no spatialOrder. Declare the comparable candidate set and query direction, or keep this reading unresolved for human review.` });
+        : `Original query contains ordinal wording, but reading ${reading.id} has no contract.interpretations[i].spatialOrder. Preserve every plausible reading and declare its comparable candidate set, axis, direction and ordinal, or keep it unresolved for human review. Do not guess an order from this hint.` });
     assessment.canLock = false;
     assessment.status = order ? "contradicted" : assessment.status === "contradicted" ? "contradicted" : "unresolved";
   }
@@ -1884,6 +1924,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         const completedContext = compactCompletedGroundingContext(event.messages, loadedBatchRecords.size > 0);
         const messages = current ? compactGroundingEvidence(completedContext, { active: true,
           pinnedViewIds: [...current.pinnedViewIds], archivedViewIds: [...current.archivedViewIds],
+          requiredViewIds: requiredEvidenceViews(current),
           maxImageBase64Characters: GROUNDING_CONTEXT_MAX_BASE64_CHARS }) : completedContext;
         return messages === event.messages ? undefined : { messages };
       });
@@ -1990,6 +2031,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         };
         const content: GroundingToolContent[] = [{ type: "text", text: JSON.stringify(payload) }];
         const imageDetails: GroundingImage["details"][] = [];
+        const evidenceImageBlocks: GroundingEvidenceImageBlock[] = [];
         if (current) {
           try {
             const lessons = await selectGroundingLessons({ filePath: options.learningPath });
@@ -2005,7 +2047,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
               const image = await loadGroundingImage(sourcePath, current[1].record, modality, readRecordImage,
                 current[1].currentBbox ?? null);
               const view = registerGroundingView(current[1], image, "hypothesis");
-              current[1].pinnedViewIds.add(view.id);
+              current[1].overviewViewIds.set(modality, view.id);
+              evidenceImageBlocks.push({ imageIndex: imageDetails.length, viewIds: [view.id] });
               content.push(...image.content);
               imageDetails.push(image.details);
             }
@@ -2022,6 +2065,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         return {
           content,
           details: { records: payload.records, completed: completedCount, total, images: imageDetails,
+            evidenceImageBlocks, evidenceViewIds: evidenceImageBlocks.flatMap((block) => block.viewIds),
             requestedLimitReached, job: jobSnapshot() },
           payload,
         };
@@ -2428,6 +2472,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         const details = { key, ...groundingTargetReminder(loaded), previewOnly: true, saved: false, bbox,
           coordinateSpace: "source", constraintAssessment, proposalView, cleanView,
           evidenceViewIds: [proposalView.id, cleanView.id, ...(boundaryOverview ? [boundaryOverview.id] : []), ...boundaryViews.map((view) => view.id)],
+          evidenceImageBlocks: [{ imageIndex: 0, viewIds: [proposalView.id] }, { imageIndex: 1, viewIds: [cleanView.id] },
+            ...(boundaryOverview ? [{ imageIndex: 2, viewIds: [boundaryOverview.id, ...boundaryViews.map((view) => view.id)] }] : [])],
           ...(boundaryOverview ? { boundaryOverview, boundaryStrips: boundaryViews,
             boundaryNote: "Optional four-edge context check. Outside-panel ticks mark the proposed edge without covering image pixels. Inspect complete visible parts and background on both sides; panels have different display scales. contextClipped means part of the requested context was clipped at any source boundary, not necessarily this proposal edge. outsideSourcePixels is the distance from this proposal edge to its corresponding source edge; zero means no further pixels on that side. These views never adjust the proposal or establish identity." } : {}),
           nextAction: "inspect_preview_then_request_review",
@@ -2512,7 +2558,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const loaded: LoadedBatchRecord = { sourcePath, outputDirectory: outputDir, record, grantedModalities: new Set(),
             currentBbox: previous.bbox, settleNudges: 0, revision: true, ...recordEvidence() };
           const view = registerGroundingView(loaded, image, "hypothesis");
-          loaded.pinnedViewIds.add(view.id);
+          loaded.overviewViewIds.set("visible", view.id);
           grantRecordModality(loaded, "visible");
           loadedBatchRecords.set(params.key, loaded);
           batchMode = true; batchToolStarted = true; batchExhausted = false;
@@ -2523,6 +2569,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           persistJob();
           setGroundingToolsActive(true);
           const details = { key: params.key, query: record.query, previousPrediction: previous,
+            evidenceViewIds: [view.id], evidenceImageBlocks: [{ imageIndex: 0, viewIds: [view.id] }],
             queryPath: sourcePath, outputDir, revision: true, note: "This is the run's own approved prediction. Apply the user's correction; save only after another human review." };
           return { content: [{ type: "text" as const, text: JSON.stringify(details) }, ...image.content], details };
         },
@@ -2598,8 +2645,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const details = { key, ...groundingTargetReminder(loaded), modality: "visible", source: source.label,
             role: "measurement_only", establishesObjectIdentity: false, saved: false,
             region: result.region, regionPixels: result.regionPixels, operations, reason: params.reason,
-            panels, evidenceViewIds: panels.map((panel) => panel.id), warnings: result.warnings, renderReused,
-            note: "Original first, derived panels labeled. All use original visible-source geometry; coordinates refer to the whole returned canvas within each panel's displayRect. Processing never establishes identity or recovers hidden boundaries. Cache reuse still returns pixels and does not save image tokens. grounding_view recalls original source pixels, not this transformation." };
+            panels, evidenceViewIds: panels.map((panel) => panel.id), evidenceImageBlocks: [{ imageIndex: 0, viewIds: panels.map((panel) => panel.id) }], warnings: result.warnings, renderReused,
+            note: "Original first, derived panels labeled. All use original visible-source geometry; coordinates refer to the whole returned canvas within each panel's displayRect. Processing never establishes identity or recovers hidden boundaries. Cache reuse returns pixels to the transcript; context deduplicates only exact encoded copies whose pixels remain retained. grounding_view recalls original source pixels, not this transformation." };
           return { content: [{ type: "text" as const, text: JSON.stringify(details) },
             { type: "image" as const, data: encoded.data, mimeType: encoded.mimeType }], details };
         },
@@ -2658,7 +2705,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             region: result.region, regionPixels: result.regionPixels, options: result.options,
             sourceWidth: result.sourceWidth, sourceHeight: result.sourceHeight,
             candidates: result.candidates, status: result.status, componentsTruncated: result.componentsTruncated,
-            panels, evidenceViewIds: panels.map(panel => panel.id), warnings: result.warnings, reason: params.reason,
+            panels, evidenceViewIds: panels.map(panel => panel.id), evidenceImageBlocks: [{ imageIndex: 0, viewIds: panels.map(panel => panel.id) }], warnings: result.warnings, reason: params.reason,
             note: "All candidate boxes are full visible-source normalized pixel edges. Panel coordinates refer to the whole sheet within displayRect. No candidate is selected, locked, saved or approved. Derived view recall shows original pixels. Same-source rerenders are not independent support." };
           return { content: [{ type: "text" as const, text: JSON.stringify(details) },
             { type: "image" as const, data: encoded.data, mimeType: encoded.mimeType }], details };
@@ -2724,7 +2771,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             note: "Local visible-image color measurement only. selectionAssessment.establishesObjectIdentity is always false. Bounds enclose selected matching pixels, not necessarily the whole target or part; verify identity and boundaries against visible structure, and discard misleading measurements." };
           const view = loaded.views.register({ modality: "visible", region: analysis.region, sourceWidth: analysis.sourceWidth,
             sourceHeight: analysis.sourceHeight, width: encodedRawPreview.width, height: encodedRawPreview.height, decorations: "none", label: "Color ROI (raw and mask share coordinates)" });
-          const evidenceDetails = { ...details, viewId: view.id, coordinateMapping: view, evidenceViewIds: [view.id] };
+          const evidenceDetails = { ...details, viewId: view.id, coordinateMapping: view, evidenceViewIds: [view.id],
+            evidenceImageBlocks: [{ imageIndex: 0, viewIds: [view.id] }, { imageIndex: 1, viewIds: [view.id] }] };
           return { content: [
             { type: "text" as const, text: JSON.stringify(evidenceDetails) },
             { type: "image" as const, data: encodedRawPreview.data, mimeType: encodedRawPreview.mimeType },
@@ -2746,7 +2794,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Missing or unresolved contracts stay reviewable as unresolved at low confidence; no extra color/crop call is required. Unsupported locks are returned as reconsidering with explicit constraintAssessment issues. Fix only what current evidence supports; never fabricate evidence to clear a check.",
           "If the referent or requested rank cannot be established and there is no concrete remaining visual check, pass clarification with one specific question for the user. This ends the current run and waits on the same unsaved record without requiring a box. A real user response releases the wait; it never approves, saves or advances. Use ordinary unresolved human review instead when a best-supported proposal is useful.",
           "As soon as identity and every required order/relation are established, set state.selection to locked with a rough source-normalized bbox and direct evidence. Locked means no identity or rank check remains; it is not a tentative pick. This limits later views to target boundary measurement. Use reconsidering while comparison is still needed or after naming new visible counterevidence; a generic possibility of hidden candidates is not counterevidence.",
-          "Archive only superseded or redundant views after keeping the evidence and counterexamples that matter. Pin overrides archive; the record's original overview stays available. For a comparison image, every panel viewId must be archived before that whole image is omitted.",
+          "Archive only superseded or redundant views after keeping evidence and counterexamples that matter. Up to 8 explicit pins retain important counterevidence; unpin superseded views in the same call. Original sensor overviews and the current working set are retained automatically. Independent image blocks archive separately; a composite sheet requires all panel IDs. Required pixels above the image allowance produce a capacity warning, not silent loss.",
         ],
         parameters: Type.Object({
           key: Type.Optional(Type.String()),
@@ -2789,10 +2837,14 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           for (const id of [...(params.pin ?? []), ...(params.unpin ?? []), ...(params.archive ?? []), ...(params.restore ?? [])]) {
             if (!loaded.views.get(id)) throw new Error(`Unknown viewId ${id} for this record. List the current record's views first.`);
           }
-          for (const id of params.unpin ?? []) loaded.pinnedViewIds.delete(id);
+          const nextPins = new Set(loaded.pinnedViewIds);
+          for (const id of params.unpin ?? []) nextPins.delete(id);
+          for (const id of params.pin ?? []) nextPins.add(id);
+          if (nextPins.size > GROUNDING_MAX_PINNED_VIEWS) throw new Error(`At most ${GROUNDING_MAX_PINNED_VIEWS} views can be explicitly pinned. Unpin superseded views in the same call before adding important counterevidence. No pins or evidence state were changed.`);
+          loaded.pinnedViewIds = nextPins;
           for (const id of params.archive ?? []) loaded.archivedViewIds.add(id);
           for (const id of params.restore ?? []) loaded.archivedViewIds.delete(id);
-          for (const id of params.pin ?? []) loaded.pinnedViewIds.add(id);
+
           loaded.workingState = state;
           // Updating notes or listing views must not erase the target lock or
           // replace a measured hypothesis with the lock's earlier rough bounds.
@@ -2813,11 +2865,14 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           }
           const all = loaded.views.list();
           const offset = params.offset ?? 0;
+          const originalOverviews = new Set(loaded.overviewViewIds.values());
           const views = all.slice(offset, offset + (params.limit ?? 20)).map((view) => ({ ...view,
-            pinned: loaded.pinnedViewIds.has(view.id), archived: loaded.archivedViewIds.has(view.id) && !loaded.pinnedViewIds.has(view.id) }));
+            pinned: loaded.pinnedViewIds.has(view.id) || originalOverviews.has(view.id),
+            originalOverview: originalOverviews.has(view.id), explicitlyPinned: loaded.pinnedViewIds.has(view.id),
+            archived: loaded.archivedViewIds.has(view.id) && !loaded.pinnedViewIds.has(view.id) && !originalOverviews.has(view.id) }));
           const details = { key, ...groundingTargetReminder(loaded), state: state ?? {}, constraintAssessment, lockDeferred, views, totalViews: all.length,
             nextOffset: offset + views.length < all.length ? offset + views.length : null,
-            note: "Facts are direct observations; hypotheses are unverified object/part interpretations. A selected target limits later views to its region; set selection to reconsidering only when new visible counterevidence requires reopening identity. Color membership never establishes identity. Only explicitly archived image payloads leave subsequent model input; use grounding_view with viewId to inspect a source region again." };
+            note: "Facts are direct observations; hypotheses are unverified object/part interpretations. A selected target limits later views to its region; set selection to reconsidering only when new visible counterevidence requires reopening identity. Color membership never establishes identity. Explicit archival and visual working-set limits may omit individual image blocks; identical pixels may be referenced where still retained. Original sensor overviews, latest per-modality observations, current candidate and explicit counterevidence pins are prioritized. A capacity warning means required pixels exceed the image allowance, not that the provider payload is within its limit. Do not reopen views just to repeat resolved checks." };
           return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
         },
       });
@@ -2827,6 +2882,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         label: "Grounding candidate comparison",
         description: "Compare model-chosen regions in clean detail panels with an annotated full-image overview. Optional object bboxes enable source-center/size/order geometry distinct from inspection ROIs. No object detection: you choose every ROI and candidate box. Returns panel viewIds with exact composite-image coordinates; pass the chosen panel viewId and view_pixels/view_normalized when saving a measured box.",
         promptGuidelines: [
+          "Set regions[i].modality for each sensor (defaults to top-level modality, then visible). Generated labels name actual sensors. A single comparison can include visible/infrared/depth panels with independent source regions; never infer registration or cross-sensor rank. The overview shows the first panel sensor only.",
           "Use overview for relations between candidates and detail panels for local parts. Every panel label is outside its pixels; different panel scales must not be used to compare real object size. You may call again with more candidates; the 4-panel limit bounds one image only.",
           "The overview marks inspection ROIs with dashed cyan outlines and optional declared object bboxes with solid orange outlines. Supply bbox only when you can identify the object's extent; region is viewing context, not an object box. sourceGeometry sorts only supplied object centers, reports missing boxes/ties, and does not establish identity or complete scene membership.",
           "For ordinal queries, establish which candidates satisfy the object description, then order them along the requested axis and direction in a common source-image frame. Panel labels and discovery order are not spatial rank. Recompute the order when a candidate is added, removed or reidentified; do not invent a candidate to satisfy the requested number.",
@@ -2834,7 +2890,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         parameters: Type.Object({
           key: Type.Optional(Type.String()), queryPath: Type.Optional(Type.String()),
           modality: Type.Optional(Type.Union([Type.Literal("visible"), Type.Literal("infrared"), Type.Literal("depth")])),
-          regions: Type.Array(Type.Object({ label: Type.String({ minLength: 1, maxLength: 80 }),
+          regions: Type.Array(Type.Object({ modality: Type.Optional(Type.Union([Type.Literal("visible"), Type.Literal("infrared"), Type.Literal("depth")], { description: "This panel source sensor; overrides top-level modality (default visible). region and bbox refer only to this sensor." })), label: Type.String({ minLength: 1, maxLength: 80 }),
             region: Type.Array(Type.Number(), { minItems: 4, maxItems: 4 }),
             bbox: Type.Optional(Type.Array(Type.Number(), { minItems: 4, maxItems: 4, description: "Optional actual candidate object bbox in this modality's source frame, distinct from the inspection region. Enables declared-object center/size/order geometry; does not establish identity or complete candidate membership." })) }), { minItems: 1, maxItems: 4 }),
           reason: Type.String({ minLength: 8 }),
@@ -2853,20 +2909,28 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const modality = params.modality ?? "visible";
           if (!["visible", "infrared", "depth"].includes(modality)) throw new Error("Unknown modality.");
           if (params.reason.trim().length < 8) throw new Error("Explain which ambiguity this comparison will resolve.");
-          const regions = params.regions.map((item) => ({ label: item.label, region: validateBoundingBox(item.region), bbox: item.bbox ? validateBoundingBox(item.bbox) : undefined }));
-          const overview = await loadGroundingImage(loaded.sourcePath, loaded.record, modality, readRecordImage, null, false);
-          const crops = await Promise.all(regions.map((item) => loadGroundingCrop(loaded.sourcePath, loaded.record, modality, item.region, null, readRecordImage, 1, "none")));
+          const regions = params.regions.map((item, index) => {
+            const sensor = item.modality ?? modality;
+            if (!["visible", "infrared", "depth"].includes(sensor)) throw new Error(`regions[${index}].modality must be visible, infrared, or depth.`);
+            return { id: String.fromCharCode(65 + index), modality: sensor, label: `[${sensor}] ${item.label}`,
+              region: validateBoundingBox(item.region), bbox: item.bbox ? validateBoundingBox(item.bbox) : undefined };
+          });
+          // One explicitly labelled overview, never projected annotations from another sensor.
+          const overviewModality = regions[0].modality;
+          const overview = await loadGroundingImage(loaded.sourcePath, loaded.record, overviewModality, readRecordImage, null, false);
+          const crops = await Promise.all(regions.map((item) => loadGroundingCrop(loaded.sourcePath, loaded.record, item.modality, item.region, null, readRecordImage, 1, "none")));
           const bytes = (image: GroundingImage) => {
             const block = image.content.find((item) => item.type === "image");
             if (!block || block.type !== "image") throw new Error("Missing comparison pixels.");
             return Buffer.from(block.data, "base64");
           };
           const annotations = regions.flatMap((item, index) => {
-            const id = String.fromCharCode(65 + index);
+            if (item.modality !== overviewModality) return [];
+            const id = item.id;
             return [{ label: `${id} ROI`, region: crops[index].details.cropNormalized!, kind: "roi" as const },
               ...(item.bbox ? [{ label: `${id} object`, region: item.bbox, kind: "object" as const }] : [])];
           });
-          const comparison = await buildGroundingComparison(bytes(overview), crops.map((crop, index) => ({ label: regions[index].label, image: bytes(crop) })), annotations);
+          const comparison = await buildGroundingComparison(bytes(overview), crops.map((crop, index) => ({ label: regions[index].label, image: bytes(crop) })), annotations, `Overview [${overviewModality}] only`);
           const encodedComparison = await encodeGroundingPreview(comparison.image, "image/png");
           const scaleX = encodedComparison.width / comparison.width;
           const scaleY = encodedComparison.height / comparison.height;
@@ -2879,18 +2943,27 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             const view = loaded.views.register(input);
             return { ...view, ...(sourceReuse ? { sourceReuse } : {}) };
           };
-          const overviewView = registerComparisonView({ modality, region: [0, 0, 1, 1], sourceWidth, sourceHeight,
-            width: encodedComparison.width, height: encodedComparison.height, displayRect: scaleRect(comparison.overviewRect), decorations: "hypothesis", label: "Overview" });
-          const panels = comparison.panels.map((panel, index) => registerComparisonView({ modality,
-            region: crops[index].details.cropNormalized!, sourceWidth, sourceHeight, width: encodedComparison.width, height: encodedComparison.height,
+          const overviewView = registerComparisonView({ modality: overviewModality, region: [0, 0, 1, 1], sourceWidth, sourceHeight,
+            width: encodedComparison.width, height: encodedComparison.height, displayRect: scaleRect(comparison.overviewRect), decorations: "hypothesis", label: `Overview [${overviewModality}] only` });
+          if (!loaded.overviewViewIds.has(overviewModality)) loaded.overviewViewIds.set(overviewModality, overviewView.id);
+          const panels = comparison.panels.map((panel, index) => registerComparisonView({ modality: regions[index].modality,
+            region: crops[index].details.cropNormalized!, sourceWidth: crops[index].details.originalWidth!, sourceHeight: crops[index].details.originalHeight!, width: encodedComparison.width, height: encodedComparison.height,
             displayRect: scaleRect(panel.rect), decorations: "none", label: panel.label }));
-          grantRecordModality(loaded, modality);
+          for (const sensor of new Set(regions.map((item) => item.modality))) grantRecordModality(loaded, sensor);
+          const sourceGeometryByModality = [...new Set(regions.map((item) => item.modality))].map((sensor) => {
+            const indices = regions.flatMap((item, index) => item.modality === sensor ? [index] : []);
+            const first = crops[indices[0]].details;
+            return { modality: sensor, sourceWidth: first.originalWidth!, sourceHeight: first.originalHeight!,
+              ...groundingCandidateGeometry(indices.map((index) => ({ ...regions[index], region: crops[index].details.cropNormalized! })), first.originalWidth!, first.originalHeight!) };
+          });
           const repeatedPanels = panels.filter((panel) => panel.sourceReuse);
-          const details = { key, ...groundingTargetReminder(loaded), modality, reason: params.reason, overview: overviewView, panels,
-            sourceGeometry: groundingCandidateGeometry(regions.map((item, index) => ({ ...item, region: crops[index].details.cropNormalized! })), sourceWidth, sourceHeight),
+          const details = { key, ...groundingTargetReminder(loaded), modality: sourceGeometryByModality.length === 1 ? overviewModality : "mixed", reason: params.reason, overview: overviewView, panels,
+            ...(sourceGeometryByModality.length === 1 ? { sourceGeometry: sourceGeometryByModality[0] } : {}),
+            sourceGeometryByModality,
+            evidenceImageBlocks: [{ imageIndex: 0, viewIds: [overviewView.id, ...panels.map((view) => view.id)] }],
             evidenceViewIds: [overviewView.id, ...panels.map((view) => view.id)],
             ...(repeatedPanels.length ? { decisionCheckpoint: `${repeatedPanels.length} comparison panel(s) substantially reuse prior source pixels. Reuse the prior comparison unless a concrete identity or order question remains unresolved.` } : {}),
-            note: "Use one panel's viewId. view_pixels and view_normalized refer to this WHOLE comparison canvas; the box must lie inside that panel's displayRect. Source coordinates use coordinateSpace source. Panels may have different display scales." };
+            note: "Use one panel's viewId. view_pixels and view_normalized refer to this WHOLE comparison canvas; the box must lie inside that panel's displayRect. Source coordinates belong to each panel sensor. Only visible panel viewIds can map a saved visible bbox. Other sensors are unregistered evidence: no cross-sensor geometry, rank or coordinate transfer. The overview annotates its named sensor only. Panels may have different display scales." };
           return { content: [{ type: "text" as const, text: JSON.stringify(details) },
             { type: "image" as const, data: encodedComparison.data, mimeType: encodedComparison.mimeType }], details };
         },
@@ -2910,7 +2983,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Use one or more focus crops when the target is small, ambiguous, or needs closer inspection. You decide whether to crop, how many crops to request, and the zoom for each crop. The runtime does not force a crop before saving.",
           "Do not tile the image to rule out merely hypothetical hidden candidates. For an ordinal query, use the overview as the common ordering frame; once enough visible candidates establish the requested rank, record state.selection and stop inspecting candidates that cannot change that rank.",
           "After state.selection is locked, further crops must intersect that candidate and answer a boundary or requested-part question. To switch candidates, first set selection to reconsidering in grounding_evidence and name the new visible counterevidence; uncertainty by itself is not a reason to restart the search.",
-          "To recall the same region, use viewId without region. To crop within that displayed view, provide viewId + region + coordinateSpace view_normalized or view_pixels. For a new full-source region omit viewId and use source-normalized coordinates or source_pixels. Bare integer regions outside 0..1 are recovered as pixels only when the frame is unambiguous; prefer an explicit coordinateSpace. Never assume crop-local numbers are source coordinates.",
+          "To recall the same region, use viewId without region. To crop within that displayed view, provide viewId + region + coordinateSpace view_normalized or view_pixels. For a new full-source region omit viewId and use source-normalized coordinates or source_pixels. Bare integer regions outside 0..1 without viewId are recovered as source pixels; viewId + region always requires an explicit coordinateSpace. Never assume crop-local numbers are source coordinates.",
           "For a box read from this display, use its viewId and coordinateSpace view_pixels or view_normalized when saving. Source grid numbers already use source coordinates. last_crop is legacy and refers only to the latest crop.",
           "When repeatedSourceViewId is returned, these source pixels were already examined; explain what new question another rendering answers. Use grounding_compare for identity ambiguity and grounding_evidence to retain facts and archive redundant views, without a fixed crop count.",
           "A crop that reaches the source image border reports touchesSourceEdge, which means no margin exists on that side; do not assume hidden context beyond the reported crop span.",
@@ -2978,8 +3051,11 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           let inputCoordinateSpace = params.coordinateSpace as GroundingViewCoordinateSpace | undefined;
           let requestedRegion: [number, number, number, number] | undefined;
           if (regionInput) {
+            if (recalled && !inputCoordinateSpace) {
+              throw new Error(`region is ambiguous with viewId ${recalled.id}. Set coordinateSpace: "view_pixels" for whole-display pixel edges, "view_normalized" for whole-display normalized edges, or "source" for full ${modality}-source normalized edges. Repair only coordinateSpace after checking where these edges were measured; for example "coordinateSpace":"view_pixels" only for whole-display pixel edges. Do not convert or relabel ambiguous numbers by assumption. Keep existing observations; no new image call is needed just to repair this field.`);
+            }
             if (!inputCoordinateSpace && looksLikePixelBox(regionInput)) {
-              inputCoordinateSpace = recalled ? "view_pixels" : "source_pixels";
+              inputCoordinateSpace = "source_pixels";
             }
             inputCoordinateSpace ??= "source";
             if (inputCoordinateSpace === "view_pixels" || inputCoordinateSpace === "view_normalized") {
@@ -2993,10 +3069,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
               if (!sourceView) throw new Error("source_pixels requires an existing view of this modality so its source dimensions are known.");
               requestedRegion = sourcePixelsToNormalized(regionInput, sourceView.sourceWidth, sourceView.sourceHeight);
             } else if (inputCoordinateSpace === "source") {
-              if (recalled && params.coordinateSpace === undefined) {
-                throw new Error("A normalized region is ambiguous with viewId. Omit viewId, or use an explicit coordinateSpace of source, view_pixels, or view_normalized.");
-              }
               requestedRegion = validateBoundingBox(regionInput);
+            } else {
+              throw new Error("coordinateSpace must be source, source_pixels (without viewId), view_pixels, or view_normalized.");
             }
           } else {
             if (params.coordinateSpace && params.coordinateSpace !== "source") {
@@ -3015,7 +3090,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             const zoom = params.zoom ?? (recalled && !regionInput
               ? Math.max(1, ((recalled.displayRect?.[2] ?? recalled.width) - (recalled.displayRect?.[0] ?? 0)) / (recalled.sourceWidth * (recalled.region[2] - recalled.region[0])))
               : undefined);
-            const overview = loaded.grantedModalities.has(modality) ? undefined : await loadGroundingImage(sourcePath, loaded.record, modality, readRecordImage, null, false);
+            const overview = loaded.overviewViewIds.has(modality) ? undefined : await loadGroundingImage(sourcePath, loaded.record, modality, readRecordImage, null, false);
             const region = validateBoundingBox(requestedRegion);
             if (selected && !boxesIntersect(selected, region)) {
               throw new Error(
@@ -3024,11 +3099,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
               );
             }
             const image = await loadGroundingCrop(sourcePath, loaded.record, modality, region, currentBbox, readRecordImage, zoom, decorations);
+            const overviewView = overview ? registerGroundingView(loaded, overview, "none") : undefined;
             const view = registerGroundingView(loaded, image, decorations);
-            if (overview) {
-              const overviewView = registerGroundingView(loaded, overview, "none");
-              loaded.pinnedViewIds.add(overviewView.id);
-            }
+            if (overviewView) loaded.overviewViewIds.set(modality, overviewView.id);
             grantRecordModality(loaded, modality);
             if (modality === "visible") loaded.currentBbox = currentBbox ?? undefined;
             loaded.lastCropRegion = image.details.cropNormalized!;
@@ -3045,9 +3118,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
               image: image.details,
               viewId: view.id,
               ...(view.sourceReuse ? { sourceReuse: view.sourceReuse } : {}),
-              // A newly attached full-modality overview must not be archived
-              // together with its first detail crop.
-              ...(overview ? {} : { evidenceViewIds: [view.id] }),
+              evidenceViewIds: [...(overviewView ? [overviewView.id] : []), view.id],
+              evidenceImageBlocks: [...(overviewView ? [{ imageIndex: 0, viewIds: [overviewView.id] }] : []),
+                { imageIndex: overviewView ? 1 : 0, viewIds: [view.id] }],
             };
             return {
               content: [
@@ -3065,9 +3138,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const image = await loadGroundingImage(sourcePath, loaded.record, modality, readRecordImage, currentBbox,
             decorations === "all" || decorations === "hypothesis");
           const view = registerGroundingView(loaded, image, decorations);
-          const newModality = !loaded.grantedModalities.has(modality);
+          const newModality = !loaded.overviewViewIds.has(modality);
           grantRecordModality(loaded, modality);
-          if (newModality) loaded.pinnedViewIds.add(view.id);
+          if (newModality) loaded.overviewViewIds.set(modality, view.id);
           if (modality === "visible") loaded.currentBbox = currentBbox ?? undefined;
           persistJob();
           const details: GroundingViewDetails = {
@@ -3080,7 +3153,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             image: image.details,
             viewId: view.id,
             ...(view.sourceReuse ? { sourceReuse: view.sourceReuse } : {}),
-            ...(newModality ? {} : { evidenceViewIds: [view.id] }),
+            evidenceViewIds: [view.id],
+            evidenceImageBlocks: [{ imageIndex: 0, viewIds: [view.id] }],
           };
           return {
             content: [
@@ -3212,6 +3286,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
               ...next.content.slice(1),
             ],
             details: { saved, next: next.details,
+              completedRecordImageCount: 1 + verificationContent.filter((block) => block.type === "image").length,
+              evidenceImageBlocks: next.details.evidenceImageBlocks,
+              evidenceViewIds: next.details.evidenceViewIds,
               ...(learningSaved ? { learningSaved: true } : {}), ...(learningWarning ? { learningWarning } : {}) },
             terminate: !key,
           };

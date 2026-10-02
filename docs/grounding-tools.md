@@ -69,21 +69,37 @@ agent to name the unresolved question before it repeats substantially the same
 source pixels. This feedback is advisory and does not block a needed view.
 
 `grounding_compare` accepts 1–4 labeled source-normalized regions per call and
-returns one image containing the full overview and A/B/C/D detail panels.
+returns one image containing an explicitly sensor-labeled overview and A/B/C/D detail panels.
+Each `regions[i].modality` overrides top-level `modality` (default: visible).
+Panel labels are generated from the actual sensor, and each panel retains its own
+source dimensions and source-normalized region. A mixed comparison can answer
+a cross-sensor visual question in one call without assuming registration.
 The limit bounds one payload, not total comparisons. Detail-panel labels are outside the
 image content. Different panel display scales must not be interpreted as
 different object sizes; use the overview and source regions for those relations.
 
-The comparison overview marks each panel's inspection ROI with a dashed cyan
+The comparison overview shows the first panel's sensor only and marks only that sensor's inspection ROIs with a dashed cyan
 outline and its A/B/C/D identifier. An optional `regions[].bbox` declares the
 actual object's source-normalized bounds, shown in orange. The viewing ROI is
 not automatically an object box: it may include background or just one part.
-`sourceGeometry` reports declared object centers and source-pixel sizes,
+`sourceGeometryByModality` reports independent sensor groups; mixed comparisons
+omit global `sourceGeometry` entirely. Single-sensor comparisons retain it for
+compatibility. Group IDs still refer to the original A/B/C/D panels. These report
+declared object centers and source-pixel sizes,
 left-to-right/top-to-bottom ID order, tied centers and missing object boxes.
 Only explicitly supplied object boxes enter that ordering. These are geometry
 measurements of model declarations, not detections, semantic ranks, proof of
 identity or evidence that every relevant candidate was found. Detail panels
-remain clean; the annotated overview keeps its ordinary source mapping.
+remain clean; the annotated overview keeps its ordinary source mapping. Only
+visible-panel viewIds can map saved visible boxes; IR/depth panels are evidence,
+not registered visible coordinates.
+
+`grounding_view` with both `viewId` and `region` requires explicit
+`coordinateSpace`, even for integer edges: `view_pixels` or `view_normalized`
+refer to the whole displayed canvas; `source` refers to the full sensor frame.
+Ambiguous calls fail with a field-only repair, retaining existing observations.
+Order belongs at `contract.interpretations[i].spatialOrder`, beside requirements;
+wrong nesting is rejected with the legal shape, never silently discarded.
 
 Example tool arguments (coordinates are illustrative, not predictions):
 

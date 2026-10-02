@@ -104,9 +104,12 @@ function object(input: unknown, field: string, keys: readonly string[]): Record<
   const value = input as Record<string, unknown>;
   for (const key of Object.keys(value)) {
     if (!keys.includes(key)) {
-      const hint = key === "queryText" && /^interpretations\[\d+\]$/.test(field)
-        ? " Put queryText inside each requirements[] item, not on the interpretation. Keep the existing observations; repair only this field."
-        : ` Allowed fields: ${keys.join(", ")}.`;
+      const interpretationPath = field.match(/^interpretations\[\d+\]/)?.[0] ?? "interpretations[0]";
+      const hint = key === "spatialOrder"
+        ? ` Put spatialOrder at contract.${interpretationPath}.spatialOrder, beside requirements (not inside requirements or at contract root). Shape example only: {"axis":"x","direction":"ascending","ordinal":2,"candidateIds":["existing-id"],"selectedCandidateId":"existing-id","candidateSet":{"status":"unresolved","evidence":"Membership still uncertain"}}. Use actual existing candidate IDs and query-supported axis/direction/ordinal; this example is not evidence. Keep observations and unresolved questions; repair only the nesting.`
+        : key === "queryText" && /^interpretations\[\d+\]$/.test(field)
+          ? ` Put queryText at contract.${field}.requirements[i].queryText, not on the interpretation. Requirement fields: id, queryText, description, status, evidence. Keep the existing observations; repair only this field.`
+          : ` Allowed fields: ${keys.join(", ")}.`;
       throw new Error(`Unknown grounding contract ${field} field: ${key}.${hint}`);
     }
   }
