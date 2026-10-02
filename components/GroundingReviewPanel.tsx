@@ -2,6 +2,7 @@
 /* eslint-disable @next/next/no-img-element -- review images are data URLs produced by the grounding runtime. */
 
 import { useMemo, useRef, useState } from "react";
+import { useI18n } from "@/hooks/useI18n";
 import { validateGroundingReviewLearning } from "@/lib/grounding-learning-validation";
 import { assessGroundingProposalGeometry } from "@/lib/grounding-constraints";
 import type {
@@ -86,6 +87,7 @@ export function prepareGroundingReviewLearning(
 }
 
 export function GroundingReviewPanel({ request, onInput }: Props) {
+  const { t } = useI18n();
   const details = request.details;
   const initialBbox = asBbox(details.bbox);
   const [bbox, setBbox] = useState<Bbox>(initialBbox);
@@ -380,6 +382,7 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
             {details.constraintAssessment && (
               <div role={unresolvedChecks ? "alert" : "status"} style={{ display: "grid", gap: 6, padding: "9px 10px", border: "1px solid var(--border)", borderRadius: 6, background: unresolvedChecks ? "rgba(245,158,11,0.10)" : "var(--bg-panel)", fontSize: 12, lineHeight: 1.5, overflowWrap: "anywhere" }}>
                 <strong>{unresolvedChecks ? "原始问题 / 目标证据仍有未解决项" : "模型声明的约束已通过一致性检查，仍需人工审核"}</strong>
+                {unresolvedChecks && <div>{t("groundingReview.unresolvedPreviewNote")}</div>}
                 {details.modelProposal && <div>模型原提议：{details.modelProposal.status} / {details.modelProposal.confidence.toFixed(2)}。审核默认值已按未解决证据降低。</div>}
                 {details.constraintAssessment.issues.map((issue, index) => <div key={`${issue.code}-${index}`}>• {issue.message}</div>)}
                 {details.constraintAssessment.orders.map((order) => (
@@ -472,7 +475,7 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
             </div>
 
             <label style={{ display: "grid", gap: 4, color: "var(--text-muted)", fontSize: 11 }}>
-              Evidence / reason
+              {t("groundingReview.modelReason")}
               <textarea aria-label="Evidence reason" value={reason} onChange={(event) => setReason(event.target.value)} rows={3} style={{ resize: "vertical", padding: "7px 8px", border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg-panel)", color: "var(--text)", fontSize: 12, lineHeight: 1.4 }} />
             </label>
 

@@ -60,6 +60,17 @@ const nextConfig: NextConfig = {
   ],
   async headers() {
     return [
+      // Turbopack development chunk URLs are stable across source changes.
+      // Explicitly prohibit browser/CDN storage rather than relying on a
+      // zero max-age, which an edge browser-TTL rule may increase.
+      ...(process.env.NODE_ENV === "development" ? [{
+        source: "/_next/static/:path*",
+        headers: [
+          { key: "Cache-Control", value: "private, no-store, max-age=0, must-revalidate" },
+          { key: "CDN-Cache-Control", value: "no-store" },
+          { key: "Cloudflare-CDN-Cache-Control", value: "no-store" },
+        ],
+      }] : []),
       {
         source: "/",
         headers: [

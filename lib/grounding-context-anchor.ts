@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { groundingDecisionCheckpoint } from "./grounding-decision-checkpoint";
 import type { GroundingWorkingState } from "./grounding-evidence";
 
 export const GROUNDING_CONTEXT_ANCHOR = "grounding:ephemeral-request-anchor:v1";
@@ -8,6 +9,7 @@ type AnchorRecord = {
   originalQuery: string;
   state?: GroundingWorkingState;
   awaitingClarification?: string;
+  decisionCheckpoint?: ReturnType<typeof groundingDecisionCheckpoint>;
 };
 
 type UnloadedRuntime = {
@@ -38,6 +40,7 @@ export function withGroundingContextAnchor(messages: AgentMessage[], record?: An
     recordKey: record.key,
     originalQuery: record.originalQuery,
     pausedForClarification: Boolean(record.awaitingClarification),
+    decisionCheckpoint: record.decisionCheckpoint,
     declaredState: {
       selection: state?.selection ? { status: state.selection.status, bbox: state.selection.bbox } : undefined,
       selectedCandidateId: contract?.selectedCandidateId,
