@@ -225,6 +225,12 @@ type GroundingToolContent =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: string };
 
+type GroundingToolResult<Details> = {
+  content: GroundingToolContent[];
+  details: Details;
+  terminate?: boolean;
+};
+
 type GroundingImage = {
   content: GroundingToolContent[];
   details: {
@@ -1838,6 +1844,10 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details, terminate: true };
       };
 
+      // SDK registerTool infers details from the first return branch. Declare
+      // both result variants so a clarification pause cannot narrow normal output.
+      type ClarificationPauseResult = NonNullable<ReturnType<typeof clarificationPauseResult>>;
+
       // Actual human input releases the wait, including a short answer or an
       // image-only correction. Extension follow-ups and output-limit recovery
       // are not answers. Nothing here saves, approves, or advances a record.
@@ -2362,7 +2372,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           })),
         }),
         executionMode: "sequential",
-        async execute(_toolCallId, params) {
+        async execute(_toolCallId, params): Promise<GroundingToolResult<ClarificationPauseResult["details"] | Awaited<ReturnType<typeof loadNextRecord>>["details"]>> {
           const paused = clarificationPauseResult();
           if (paused) return paused;
           // Tool use is authoritative: users should not need to write a
@@ -2543,7 +2553,11 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           key: Type.String(), queryPath: Type.Optional(Type.String()), outputDir: Type.Optional(Type.String()),
         }),
         executionMode: "sequential",
-        async execute(_id, params) {
+        async execute(_id, params): Promise<GroundingToolResult<ClarificationPauseResult["details"] | {
+          key: string; query: string; previousPrediction: GroundingProgress;
+          evidenceViewIds: string[]; evidenceImageBlocks: GroundingEvidenceImageBlock[];
+          queryPath: string; outputDir: string; revision: boolean; note: string;
+        }>> {
           if (!active) throw new Error("Grounding runtime safety is not active for this session.");
           const paused = clarificationPauseResult();
           if (paused) return paused;
@@ -2818,7 +2832,16 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           offset: Type.Optional(Type.Integer({ minimum: 0 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
         }),
         executionMode: "sequential",
-        async execute(_id, params) {
+        async execute(_id, params): Promise<GroundingToolResult<ClarificationPauseResult["details"] | (ReturnType<typeof groundingTargetReminder> & {
+          key: string; state: GroundingWorkingState; constraintAssessment: GroundingConstraintAssessment;
+          lockDeferred: boolean; views: Array<GroundingViewDescriptor & {
+            pinned: boolean; protected: boolean; protectionReason?: string;
+            originalOverview: boolean; explicitlyPinned: boolean; archived: boolean;
+          }>; totalViews: number; nextOffset: number | null;
+          archiveResults?: Array<{ viewId: string; changed: boolean; archived: boolean; reason: string }>;
+          unpinResults?: Array<{ viewId: string; changed: boolean; reason: string }>;
+          note: string;
+        })>> {
           const paused = clarificationPauseResult();
           if (paused) return paused;
           const [key, loaded] = resolveLoadedRecord(params, true);
