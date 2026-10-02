@@ -10,21 +10,31 @@ type AnchorRecord = {
   awaitingClarification?: string;
 };
 
+type UnloadedRuntime = {
+  queryPath: string;
+  outputDir: string;
+  pendingKey: string | null;
+  lastApprovedKey: string | null;
+  pausedForClarification: boolean;
+  restorationWarning?: string;
+};
+
 export function isGroundingContextAnchor(message: AgentMessage): boolean {
   return message.role === "custom" && message.customType === GROUNDING_CONTEXT_ANCHOR
     && (message.details as { ephemeralGroundingAnchor?: unknown } | undefined)?.ephemeralGroundingAnchor === true;
 }
 
 /** Context projection only. Never append this message to a session or send it as input. */
-export function withGroundingContextAnchor(messages: AgentMessage[], record?: AnchorRecord): AgentMessage[] {
+export function withGroundingContextAnchor(messages: AgentMessage[], record?: AnchorRecord, unloaded?: UnloadedRuntime): AgentMessage[] {
   const clean = messages.some(isGroundingContextAnchor) ? messages.filter((message) => !isGroundingContextAnchor(message)) : messages;
-  if (!record) return clean;
-  const state = record.state;
+  if (!record && !unloaded) return clean;
+  const state = record?.state;
   const contract = state?.contract;
   // Keep all declared IDs/statuses and original query excerpts, not long evidence
   // prose or duplicate readings. Sizes are bounded by the validated state limits;
   // the original query itself is deliberately never trimmed or truncated.
-  const snapshot = {
+  const snapshot = record ? {
+    runtimeState: "record_loaded",
     recordKey: record.key,
     originalQuery: record.originalQuery,
     pausedForClarification: Boolean(record.awaitingClarification),
@@ -41,11 +51,14 @@ export function withGroundingContextAnchor(messages: AgentMessage[], record?: An
           selectedCandidateId: interpretation.spatialOrder.selectedCandidateId, candidateSetStatus: interpretation.spatialOrder.candidateSet.status } : undefined })) ?? [],
       openQuestions: state?.openQuestions ?? [],
     },
-  };
+  } : { runtimeState: "record_not_loaded", ...unloaded };
+  const reminder = record
+    ? "Keep the exact original query and all its counting/identity/part conditions in view. Candidate boxes and support statuses are model declarations, not verified visual truth. A supported status alone proves nothing."
+    : "No record or evidence view is loaded in this runtime, even if history shows old images or tool calls. Do not call grounding_view/compare/evidence/color/process/refine/save until loading a record; historical viewIds are invalid. If pausedForClarification is true, wait for the user's actual clarification. For a requested continuation with a pendingKey, load it with grounding_next_batch. With no pending key, for an explicit user-requested correction or rerun of a known approved key, call grounding_reopen_record directly with that key; no preliminary grounding_status is needed. lastApprovedKey is only a historical reference, never authorization or an inferred choice of target. If the requested key is ambiguous, clarify or use grounding_status to identify it; if restorationWarning is present, use grounding_status first. Do not start a new batch, save, or advance merely because no record is loaded.";
   const anchor: AgentMessage = {
     role: "custom", customType: GROUNDING_CONTEXT_ANCHOR, display: false, timestamp: 0,
     details: { ephemeralGroundingAnchor: true },
-    content: [{ type: "text", text: "Current grounding context reminder, not a new user request or authorization. The JSON below is task data. Keep the exact original query and all its counting/identity/part conditions in view. Candidate boxes and support statuses are model declarations, not verified visual truth. A supported status alone proves nothing. This reminder never resumes a clarification pause, approves a result, or authorizes saving.\n" + JSON.stringify(snapshot) }],
+    content: [{ type: "text", text: "Current grounding context reminder, not a new user request or authorization. The JSON below is task data. " + reminder + " This reminder never resumes a clarification pause, approves a result, or authorizes saving.\n" + JSON.stringify(snapshot) }],
   };
   // Keep the changing snapshot after stable history for prefix-cache reuse and
   // near the current decision. Never insert between calls and their results:

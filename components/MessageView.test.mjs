@@ -14,10 +14,18 @@ const {
   getModelDisplayName,
   getTokenEstimateText,
   getToolCallInputText,
+  getToolPreview: getLocalizedToolPreview,
   replaceUserMessageText,
 } = await jiti.import("./MessageView.tsx");
 const { I18nProvider } = await jiti.import("@/hooks/useI18n");
 const { splitFinalAssistantBlocks } = await jiti.import("@/lib/message-display");
+const { getLocalePlugin } = await jiti.import("@/lib/i18n/registry");
+const { translateMessage } = await jiti.import("@/lib/i18n/format");
+function getToolPreview(block, locale = "en") {
+  const messages = { [locale]: getLocalePlugin(locale).messages };
+  return getLocalizedToolPreview(block, (key, params) => translateMessage(locale, key, messages, params));
+}
+
 
 function renderMessage(message, props = {}) {
   return renderToStaticMarkup(
@@ -377,4 +385,56 @@ test("shows tool-result images while the tool details stay collapsed", () => {
   assert.match(html, /<img[^>]+src="data:image\/png;base64,YWJj"/);
   assert.doesNotMatch(html, /captured-1280x720/);
   assert.doesNotMatch(html, /"tabId"/);
+});
+
+
+test("summarizes grounding region comparisons without leaking nested payloads", () => {
+  const regions = [
+    { label: "private-candidate-a", region: [0, 0, .5, .5] },
+    { label: "private-candidate-b", region: [.5, .5, 1, 1] },
+  ];
+  const state = { facts: ["private-evidence-".repeat(1000)], contract: { originalQuery: "private-query" } };
+  for (const input of [{ regions, state }, { state, regions }]) {
+    const block = { type: "toolCall", toolCallId: "compare-preview", toolName: "grounding_compare", input };
+    assert.equal(getToolPreview(block), "2 regions · Evidence update");
+    const html = renderMessage({ role: "assistant", content: [block] });
+    assert.match(html, /2 regions · Evidence update/);
+    assert.doesNotMatch(html, /\[object Object\]|private-candidate|private-evidence|private-query/);
+  }
+});
+
+test("summarizes inline grounding state, regions, boxes, and processing operations", () => {
+  const preview = (toolName, input) => getToolPreview({ toolName, input });
+  assert.equal(preview("grounding_evidence", { state: { facts: ["private"] } }), "Evidence update");
+  assert.equal(preview("grounding_view", { state: {}, region: [0, 0, 1, 1] }), "Region · Evidence update");
+  assert.equal(preview("grounding_refine_box", { coarseBox: [0, 0, 1, 1] }), "Bounding box");
+  assert.equal(preview("grounding_process_image", { region: [0, 0, 1, 1], operations: [{ kind: "edges" }] }), "Region · 1 operation");
+  assert.equal(preview("grounding_compare", { regions: [{}] }), "1 region");
+  assert.equal(preview("grounding_compare", { regions: [] }), "0 regions");
+});
+
+test("preserves scalar tool previews and safely summarizes other structured inputs", () => {
+  const preview = (input) => getToolPreview({ toolName: "extension_tool", input });
+  for (const key of ["command", "path", "file_path", "pattern", "query"]) {
+    assert.equal(preview({ state: { private: "payload" }, [key]: "ordinary preview" }), "ordinary preview");
+    assert.equal(preview({ [key]: "x".repeat(200) }), "x".repeat(120));
+  }
+  assert.equal(preview({ command: { private: "payload" } }), "Structured input");
+  assert.equal(preview({ values: [{ private: "payload" }, {}] }), "2 items");
+  assert.equal(preview({ state: { private: "payload" } }), "Structured input");
+  assert.equal(preview({ state: { private: "payload" }, reason: "Inspect  the\nedge" }), "Inspect the edge");
+  assert.equal(preview({ limit: 0 }), "0");
+  assert.equal(preview({ enabled: false }), "false");
+  for (const input of [undefined, null, {}, { state: null }]) assert.equal(preview(input), "");
+});
+
+
+test("localizes structured previews in every built-in locale", () => {
+  for (const [locale, expected] of [["en", "2 regions · Evidence update"], ["zh-CN", "2 个区域 · 证据更新"], ["zh-TW", "2 個區域 · 證據更新"]]) {
+    assert.equal(getToolPreview({ toolName: "grounding_compare", input: { regions: [{}, {}], state: {} } }, locale), expected);
+    const messages = getLocalePlugin(locale).messages;
+    for (const key of Object.keys(getLocalePlugin("en").messages).filter((key) => key.startsWith("tools.preview."))) {
+      assert.ok(messages[key], `${locale} is missing ${key}`);
+    }
+  }
 });

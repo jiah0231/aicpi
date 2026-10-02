@@ -1757,6 +1757,8 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       const reconcileJobProgress = (state: SanitizedQueryState, progress: Map<string, GroundingProgress>) => {
         const keys = Object.keys(state.safe);
         const completed = keys.filter((key) => progress.has(key)).length;
+        // Historical reference only; never advertise a key from another/missing run.
+        if (lastApprovedKey && (!state.safe[lastApprovedKey] || !progress.has(lastApprovedKey))) lastApprovedKey = undefined;
         jobStartCompleted ??= completed;
         sessionSavedCount = Math.max(0, completed - jobStartCompleted);
         batchToolStarted = true;
@@ -2001,6 +2003,11 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         const anchored = withGroundingContextAnchor(messages, current ? {
           key: loadedBatchRecords.keys().next().value!, originalQuery: current.record.query ?? "",
           state: current.workingState, awaitingClarification: current.awaitingClarification,
+        } : undefined, !current && lastJob ? {
+          ...lastJob, pendingKey: persistedPending?.key ?? null,
+          lastApprovedKey: lastApprovedKey ?? null,
+          pausedForClarification: Boolean(persistedPending?.awaitingClarification),
+          ...(jobRestoreWarning ? { restorationWarning: jobRestoreWarning } : {}),
         } : undefined);
         return anchored === event.messages ? undefined : { messages: anchored };
       });
@@ -2658,7 +2665,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       pi.registerTool({
         name: "grounding_reopen_record",
         label: "Grounding revise record",
-        description: "Reopen one previously approved key for a user-requested correction. Get its key from grounding_status; no directory listing needed. Original approved output remains unchanged until the revised box passes human review. Revise and finish with grounding_save_result.",
+        description: "Reopen one previously approved key for a user-requested correction. Use the known key from current runtime context or grounding_status if unknown; no preliminary status call or directory listing is needed for a known key. Original approved output remains unchanged until the revised box passes human review. Revise and finish with grounding_save_result.",
         parameters: Type.Object({
           key: Type.String(), queryPath: Type.Optional(Type.String()), outputDir: Type.Optional(Type.String()),
         }),
@@ -3683,7 +3690,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           `Job state: ${JSON.stringify(jobSnapshot())}.`,
           "Use grounding_evidence state.contract for explicit original-query constraints, alternative readings, candidate identity support and source-coordinate ordering before any lock or supported submission. Missing/contradicted evidence cannot create a locked selection or default ok review. The runtime computes geometry only over your declared comparable set; it cannot recognize objects or prove interpretation/candidate completeness. You may submit a best-supported unresolved box for human review without additional color/crop calls. Repeated renders of the same pixels do not increase identity confidence.",
           "Keep the original query and the user's task requirements as the target throughout observation, candidate changes and review. A newly noticed object, working hypothesis or convenient tool result must not silently replace the requested object or drop a required attribute, relation or order. Before submitting a box, reconcile the proposal with every requirement actually present in the request and explain the supporting evidence. If a requirement is unestablished or contradicted, state what is unresolved and use low confidence with status unresolved instead of reinterpreting the query to fit the candidate. Pixel measurements alone do not establish that the request is satisfied.",
-          "For continue/status questions, call grounding_status instead of listing directories. If remaining is zero and job.restorationWarning is absent, explain the dataset is complete; do not claim to begin the first record again. If restorationWarning reports incomplete output artifacts, call grounding_next_batch to repair them from approved progress before claiming output completion. For a user-requested correction, find the key in grounding_status and call grounding_reopen_record, then submit the revised box for human review. Do not treat your run's saved predictions as reference annotations.",
+          "For continue/status questions, call grounding_status instead of listing directories. If remaining is zero and job.restorationWarning is absent, explain the dataset is complete; do not claim to begin the first record again. If restorationWarning reports incomplete output artifacts, call grounding_next_batch to repair them from approved progress before claiming output completion. For a user-requested correction, call grounding_reopen_record directly for a known key, or find the key in grounding_status if unknown, then submit the revised box for human review. Do not treat your run's saved predictions as reference annotations.",
           "grounding_refine_box optionally measures connected-edge candidate boxes around a source-normalized coarseBox inside region. Compare its clean original, derived edges and candidate overlay; rankScore is geometric agreement, never identity confidence. It does not fill objects, merge detached parts, establish complete contours or change a target. Keep tails/protrusions and uncertainty; ordinary human review remains mandatory.",
           "grounding_process_image is an optional bounded local measurement aid: compare original visible pixels with only the needed edge/filter/sharpen/contrast/threshold views. Derived appearance is not new identity evidence and may erase or invent boundaries. Panel viewIds retain source geometry; grounding_view recalls the original source region. Skip processing clear boxes and never tune parameters to force a result.",
           "grounding_color_region is an optional local pixel-measurement aid, not a required step for every record or every colored target. First establish object/part identity from the image and context. Use it only when reliable local color contrast helps resolve a remaining boundary question; skip it if the box is clear or color is unhelpful. For unresolved identity, inspect existing evidence or use grounding_view/grounding_compare as needed. Uncertainty is preferable to a forced color match. No extra model or shell/file enumeration is needed.",
