@@ -17,7 +17,8 @@ import sharp from "sharp";
 import { Type } from "typebox";
 import type { GroundingReviewDetails, GroundingReviewResponse } from "./types";
 import { analyzeGroundingColor } from "./grounding-color";
-import { buildGroundingComparison, GroundingViewRegistry, type GroundingViewDescriptor } from "./grounding-views";
+import { processGroundingImage, validateGroundingImageOperations, type GroundingImageOperation } from "./grounding-image-processing";
+import { buildGroundingComparison, groundingCandidateGeometry, groundingBoundaryRegions, GroundingViewRegistry, type GroundingViewDescriptor } from "./grounding-views";
 import { compactGroundingEvidence, validateGroundingWorkingState, type GroundingWorkingState } from "./grounding-evidence";
 import { assessGroundingConstraints, validateGroundingConstraintContract, GROUNDING_CONSTRAINT_LIMITS,
   type GroundingConstraintContract, type GroundingConstraintAssessment } from "./grounding-constraints";
@@ -44,6 +45,7 @@ const GROUNDING_TOOL_NAMES = [
   "grounding_compare",
   "grounding_evidence",
   "grounding_color_region",
+  "grounding_process_image",
   "grounding_status",
   "grounding_reopen_record",
   "grounding_save_result",
@@ -146,6 +148,7 @@ type GroundingResultInput = {
   coordinateSpace?: string;
   viewId?: string;
   contract?: unknown;
+  boundaryStrips?: boolean;
 };
 
 
@@ -200,6 +203,12 @@ type LoadedBatchRecord = {
   pinnedViewIds: Set<string>;
   archivedViewIds: Set<string>;
   workingState?: GroundingWorkingState;
+  processedPreview?: {
+    signature: string;
+    source: Buffer;
+    result: Omit<Awaited<ReturnType<typeof processGroundingImage>>, "image">;
+    encoded: EncodedGroundingPreview;
+  };
 };
 
 type PersistedGroundingPending = {
@@ -2384,12 +2393,44 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         signal?.throwIfAborted();
         const proposalView = registerGroundingView(loaded, proposal, "hypothesis");
         const cleanView = registerGroundingView(loaded, clean, "none");
+        const boundaryContent: GroundingImage["content"] = [];
+        const boundaryViews: Array<GroundingViewDescriptor & { edge: string; contextClipped: boolean; outsideSourcePixels: number; edgeSourcePosition: number }> = [];
+        let boundaryOverview: GroundingViewDescriptor | undefined;
+        if (params.boundaryStrips) {
+          const sourceWidth = visible.details.originalWidth!, sourceHeight = visible.details.originalHeight!;
+          const strips = groundingBoundaryRegions(bbox, sourceWidth, sourceHeight);
+          const crops = await Promise.all(strips.map((strip) => loadGroundingCrop(loaded.sourcePath, loaded.record, "visible", strip.region, null, readRecordImage, undefined, "none")));
+          const bytes = (image: GroundingImage) => {
+            const block = image.content.find((item) => item.type === "image");
+            if (!block || block.type !== "image") throw new Error("Missing boundary preview pixels.");
+            return Buffer.from(block.data, "base64");
+          };
+          const sheet = await buildGroundingComparison(bytes(visible), crops.map((crop, index) => {
+            const strip = strips[index], actual = crop.details.cropNormalized!;
+            const axis = strip.axis === "x" ? 0 : 1;
+            return { label: `${strip.edge} edge${strip.contextClipped ? " | context clipped at source edge" : ""}`, image: bytes(crop),
+              edgeMarker: { axis: strip.axis, fraction: Math.max(0, Math.min(1, (strip.position - actual[axis]) / (actual[axis + 2] - actual[axis]))) } };
+          }), [{ label: "proposal", region: bbox, kind: "object" }]);
+          const encoded = await encodeGroundingPreview(sheet.image, "image/png");
+          signal?.throwIfAborted();
+          const scaleRect = (rect: readonly number[]) => rect.map((value, index) => value * (index % 2 ? encoded.height / sheet.height : encoded.width / sheet.width)) as [number, number, number, number];
+          const mapping = { modality: "visible" as const, sourceWidth, sourceHeight, width: encoded.width, height: encoded.height };
+          boundaryOverview = loaded.views.register({ ...mapping, region: [0, 0, 1, 1], displayRect: scaleRect(sheet.overviewRect), decorations: "hypothesis", label: "Boundary overview" });
+          sheet.panels.forEach((panel, index) => {
+            const strip = strips[index];
+            boundaryViews.push({ ...loaded.views.register({ ...mapping, region: crops[index].details.cropNormalized!, displayRect: scaleRect(panel.rect), decorations: "none", label: panel.label }),
+              edge: strip.edge, contextClipped: strip.contextClipped, outsideSourcePixels: strip.outsideSourcePixels, edgeSourcePosition: strip.position });
+          });
+          boundaryContent.push({ type: "image", data: encoded.data, mimeType: encoded.mimeType });
+        }
         const details = { key, ...groundingTargetReminder(loaded), previewOnly: true, saved: false, bbox,
           coordinateSpace: "source", constraintAssessment, proposalView, cleanView,
-          evidenceViewIds: [proposalView.id, cleanView.id],
+          evidenceViewIds: [proposalView.id, cleanView.id, ...(boundaryOverview ? [boundaryOverview.id] : []), ...boundaryViews.map((view) => view.id)],
+          ...(boundaryOverview ? { boundaryOverview, boundaryStrips: boundaryViews,
+            boundaryNote: "Optional four-edge context check. Outside-panel ticks mark the proposed edge without covering image pixels. Inspect complete visible parts and background on both sides; panels have different display scales. contextClipped means part of the requested context was clipped at any source boundary, not necessarily this proposal edge. outsideSourcePixels is the distance from this proposal edge to its corresponding source edge; zero means no further pixels on that side. These views never adjust the proposal or establish identity." } : {}),
           nextAction: "inspect_preview_then_request_review",
           note: "UNSAVED proposal on this record's visible image, followed by clean contextual pixels. Inspect whether the box actually contains the requested object and its complete boundaries. Correct mistaken coordinates/identity; unsupported evidence stays unresolved. Then call the save tool without previewOnly for human review. This rendering establishes no object identity and does not advance the job." };
-        return { content: [{ type: "text" as const, text: JSON.stringify(details) }, ...proposal.content, ...clean.content], details };
+        return { content: [{ type: "text" as const, text: JSON.stringify(details) }, ...proposal.content, ...clean.content, ...boundaryContent], details };
       };
 
       pi.registerTool({
@@ -2482,6 +2523,83 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const details = { key: params.key, query: record.query, previousPrediction: previous,
             queryPath: sourcePath, outputDir, revision: true, note: "This is the run's own approved prediction. Apply the user's correction; save only after another human review." };
           return { content: [{ type: "text" as const, text: JSON.stringify(details) }, ...image.content], details };
+        },
+      });
+
+      pi.registerTool({
+        name: "grounding_process_image",
+        label: "Grounding image processing",
+        description: "Optional local boundary aid: compare an original visible ROI with 1–3 independent edge/filter/sharpen/contrast/binary views in one labeled image. No detector, extra model, identity evidence, bbox inference or saving. Skip when clean pixels already answer the question. Each panel has an exact source-mapped viewId.",
+        promptGuidelines: [
+          "Choose only operations that answer a concrete remaining boundary question after identifying the object/part. Every operation starts from the same original visible ROI, never another derived preview. Edges are Sobel grayscale magnitude, not object contours; threshold is fixed grayscale binarization. Blur/median can erase narrow parts; sharpening/contrast can invent apparent outlines. Check against the original and retain uncertainty.",
+          "Pass source-normalized region, or a current visible viewId with view_pixels/view_normalized. Each output view uses whole-composite coordinates inside its displayRect. Processing preserves geometry, not identity evidence. Recall via grounding_view renders the original source region, not the processing operation. Same-source rerenders add no independent support; do not sweep parameters to force a desired boundary.",
+          "At most 3 operations, ROI 4 million pixels, source 100 million pixels/64 MB. sigma .3–3 (default 1), median size 3/5/7 (default 3), contrast gain .5–3 around gray 128 (default 1.5), threshold integer level 0–255 (default 128). Source border handling is ROI-local and transparency is composited on white. No image uploads or files are written.",
+        ],
+        parameters: Type.Object({
+          key: Type.Optional(Type.String()), queryPath: Type.Optional(Type.String()),
+          region: Type.Array(Type.Number(), { minItems: 4, maxItems: 4 }),
+          coordinateSpace: Type.Optional(Type.Union([Type.Literal("source"), Type.Literal("view_pixels"), Type.Literal("view_normalized")])),
+          viewId: Type.Optional(Type.String()),
+          operations: Type.Array(Type.Object({
+            kind: Type.Union([Type.Literal("edges"), Type.Literal("blur"), Type.Literal("median"), Type.Literal("sharpen"), Type.Literal("contrast"), Type.Literal("threshold")]),
+            sigma: Type.Optional(Type.Number({ minimum: .3, maximum: 3, description: "blur/sharpen only" })),
+            size: Type.Optional(Type.Integer({ minimum: 3, maximum: 7, description: "median only: 3, 5 or 7" })),
+            gain: Type.Optional(Type.Number({ minimum: .5, maximum: 3, description: "contrast only" })),
+            level: Type.Optional(Type.Integer({ minimum: 0, maximum: 255, description: "threshold only" })),
+          }), { minItems: 1, maxItems: 3 }),
+          reason: Type.String({ minLength: 8, maxLength: 400, description: "Concrete boundary question answered by these operations" }),
+        }),
+        executionMode: "sequential",
+        async execute(_id, params, signal) {
+          signal?.throwIfAborted();
+          const [key, loaded] = resolveLoadedRecord(params);
+          if (savingRecord) throw new Error("Wait for the current human review before processing more images.");
+          if (typeof params.reason !== "string" || params.reason.trim().length < 8 || params.reason.length > 400) throw new Error("Explain the boundary question in 8–400 characters.");
+          const operations = validateGroundingImageOperations(params.operations as GroundingImageOperation[]);
+          const coordinateSpace = params.coordinateSpace ?? "source";
+          if (!["source", "view_pixels", "view_normalized"].includes(coordinateSpace)) throw new Error("Unknown processing coordinateSpace.");
+          if (coordinateSpace === "source" && params.viewId) throw new Error("With viewId, specify view_pixels or view_normalized.");
+          if (coordinateSpace !== "source" && !params.viewId) throw new Error("View coordinates require a current-record visible viewId.");
+          const region = coordinateSpace === "source" ? validateBoundingBox(params.region)
+            : loaded.views.toVisibleSource(params.viewId!, params.region, coordinateSpace);
+          const selected = loaded.workingState?.selection?.status === "locked" ? loaded.workingState.selection.bbox : undefined;
+          if (selected && !boxesIntersect(selected, region)) throw new Error("Inspect the locked target's boundary. To reopen identity, first record new visible counterevidence with selection reconsidering.");
+          const source = await readRecordImage(loaded.sourcePath, loaded.record, "visible");
+          const signature = JSON.stringify({ region, operations });
+          const cached = loaded.processedPreview;
+          const renderReused = cached?.signature === signature && cached.source === source.bytes;
+          let result: Omit<Awaited<ReturnType<typeof processGroundingImage>>, "image">;
+          let encoded: EncodedGroundingPreview;
+          if (renderReused) ({ result, encoded } = cached!);
+          else {
+            const { image, ...processed } = await processGroundingImage(source.bytes, { region, operations }, signal);
+            result = processed;
+            encoded = await encodeGroundingPreview(image, "image/png");
+            signal?.throwIfAborted();
+            // One bounded encoded sheet per loaded record. Always resend pixels:
+            // an unarchived ID may still have been removed by the context budget.
+            loaded.processedPreview = { signature, source: source.bytes, result, encoded };
+          }
+          signal?.throwIfAborted();
+          const panels = result.panels.map((panel) => {
+            const input: Omit<GroundingViewDescriptor, "id"> = {
+              modality: "visible", region: result.region, sourceWidth: result.sourceWidth, sourceHeight: result.sourceHeight,
+              width: encoded.width, height: encoded.height, decorations: "none", label: panel.label,
+              displayRect: [panel.rect[0] * encoded.width / result.width, panel.rect[1] * encoded.height / result.height,
+                panel.rect[2] * encoded.width / result.width, panel.rect[3] * encoded.height / result.height],
+              ...(panel.operation ? { derived: { kind: "image_processing" as const, operation: JSON.stringify(panel.operation), role: "measurement_only" as const, establishesObjectIdentity: false as const } } : {}),
+            };
+            const sourceReuse = loaded.views.sourceReuse(input);
+            const view = loaded.views.register(input);
+            return { ...view, ...(panel.operation ? { operation: panel.operation } : {}), ...(sourceReuse ? { sourceReuse } : {}) };
+          });
+          const details = { key, ...groundingTargetReminder(loaded), modality: "visible", source: source.label,
+            role: "measurement_only", establishesObjectIdentity: false, saved: false,
+            region: result.region, regionPixels: result.regionPixels, operations, reason: params.reason,
+            panels, evidenceViewIds: panels.map((panel) => panel.id), warnings: result.warnings, renderReused,
+            note: "Original first, derived panels labeled. All use original visible-source geometry; coordinates refer to the whole returned canvas within each panel's displayRect. Processing never establishes identity or recovers hidden boundaries. Cache reuse still returns pixels and does not save image tokens. grounding_view recalls original source pixels, not this transformation." };
+          return { content: [{ type: "text" as const, text: JSON.stringify(details) },
+            { type: "image" as const, data: encoded.data, mimeType: encoded.mimeType }], details };
         },
       });
 
@@ -2645,20 +2763,23 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       pi.registerTool({
         name: "grounding_compare",
         label: "Grounding candidate comparison",
-        description: "Compare model-chosen candidate regions side by side with a clean full-image overview in one image. Useful for identity, ordering and size ambiguity. No object detection: you choose every ROI. Returns one viewId per panel with exact composite-image coordinates; pass that panel viewId and view_pixels/view_normalized when saving a box measured on the comparison.",
+        description: "Compare model-chosen regions in clean detail panels with an annotated full-image overview. Optional object bboxes enable source-center/size/order geometry distinct from inspection ROIs. No object detection: you choose every ROI and candidate box. Returns panel viewIds with exact composite-image coordinates; pass the chosen panel viewId and view_pixels/view_normalized when saving a measured box.",
         promptGuidelines: [
           "Use overview for relations between candidates and detail panels for local parts. Every panel label is outside its pixels; different panel scales must not be used to compare real object size. You may call again with more candidates; the 4-panel limit bounds one image only.",
+          "The overview marks inspection ROIs with dashed cyan outlines and optional declared object bboxes with solid orange outlines. Supply bbox only when you can identify the object's extent; region is viewing context, not an object box. sourceGeometry sorts only supplied object centers, reports missing boxes/ties, and does not establish identity or complete scene membership.",
           "For ordinal queries, establish which candidates satisfy the object description, then order them along the requested axis and direction in a common source-image frame. Panel labels and discovery order are not spatial rank. Recompute the order when a candidate is added, removed or reidentified; do not invent a candidate to satisfy the requested number.",
         ],
         parameters: Type.Object({
           key: Type.Optional(Type.String()), queryPath: Type.Optional(Type.String()),
           modality: Type.Optional(Type.Union([Type.Literal("visible"), Type.Literal("infrared"), Type.Literal("depth")])),
           regions: Type.Array(Type.Object({ label: Type.String({ minLength: 1, maxLength: 80 }),
-            region: Type.Array(Type.Number(), { minItems: 4, maxItems: 4 }) }), { minItems: 1, maxItems: 4 }),
+            region: Type.Array(Type.Number(), { minItems: 4, maxItems: 4 }),
+            bbox: Type.Optional(Type.Array(Type.Number(), { minItems: 4, maxItems: 4, description: "Optional actual candidate object bbox in this modality's source frame, distinct from the inspection region. Enables declared-object center/size/order geometry; does not establish identity or complete candidate membership." })) }), { minItems: 1, maxItems: 4 }),
           reason: Type.String({ minLength: 8 }),
         }),
         executionMode: "sequential",
         async execute(_id, params) {
+          if (savingRecord) throw new Error("The current record is already awaiting human review or being saved; wait for that review before comparing candidates.");
           const [key, loaded] = resolveLoadedRecord(params);
           if (loaded.workingState?.selection?.status === "locked") {
             throw new Error(
@@ -2670,7 +2791,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const modality = params.modality ?? "visible";
           if (!["visible", "infrared", "depth"].includes(modality)) throw new Error("Unknown modality.");
           if (params.reason.trim().length < 8) throw new Error("Explain which ambiguity this comparison will resolve.");
-          const regions = params.regions.map((item) => ({ ...item, region: validateBoundingBox(item.region) }));
+          const regions = params.regions.map((item) => ({ label: item.label, region: validateBoundingBox(item.region), bbox: item.bbox ? validateBoundingBox(item.bbox) : undefined }));
           const overview = await loadGroundingImage(loaded.sourcePath, loaded.record, modality, readRecordImage, null, false);
           const crops = await Promise.all(regions.map((item) => loadGroundingCrop(loaded.sourcePath, loaded.record, modality, item.region, null, readRecordImage, 1, "none")));
           const bytes = (image: GroundingImage) => {
@@ -2678,7 +2799,12 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             if (!block || block.type !== "image") throw new Error("Missing comparison pixels.");
             return Buffer.from(block.data, "base64");
           };
-          const comparison = await buildGroundingComparison(bytes(overview), crops.map((crop, index) => ({ label: regions[index].label, image: bytes(crop) })));
+          const annotations = regions.flatMap((item, index) => {
+            const id = String.fromCharCode(65 + index);
+            return [{ label: `${id} ROI`, region: crops[index].details.cropNormalized!, kind: "roi" as const },
+              ...(item.bbox ? [{ label: `${id} object`, region: item.bbox, kind: "object" as const }] : [])];
+          });
+          const comparison = await buildGroundingComparison(bytes(overview), crops.map((crop, index) => ({ label: regions[index].label, image: bytes(crop) })), annotations);
           const encodedComparison = await encodeGroundingPreview(comparison.image, "image/png");
           const scaleX = encodedComparison.width / comparison.width;
           const scaleY = encodedComparison.height / comparison.height;
@@ -2692,13 +2818,14 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             return { ...view, ...(sourceReuse ? { sourceReuse } : {}) };
           };
           const overviewView = registerComparisonView({ modality, region: [0, 0, 1, 1], sourceWidth, sourceHeight,
-            width: encodedComparison.width, height: encodedComparison.height, displayRect: scaleRect(comparison.overviewRect), decorations: "none", label: "Overview" });
+            width: encodedComparison.width, height: encodedComparison.height, displayRect: scaleRect(comparison.overviewRect), decorations: "hypothesis", label: "Overview" });
           const panels = comparison.panels.map((panel, index) => registerComparisonView({ modality,
             region: crops[index].details.cropNormalized!, sourceWidth, sourceHeight, width: encodedComparison.width, height: encodedComparison.height,
             displayRect: scaleRect(panel.rect), decorations: "none", label: panel.label }));
           grantRecordModality(loaded, modality);
           const repeatedPanels = panels.filter((panel) => panel.sourceReuse);
           const details = { key, ...groundingTargetReminder(loaded), modality, reason: params.reason, overview: overviewView, panels,
+            sourceGeometry: groundingCandidateGeometry(regions.map((item, index) => ({ ...item, region: crops[index].details.cropNormalized! })), sourceWidth, sourceHeight),
             evidenceViewIds: [overviewView.id, ...panels.map((view) => view.id)],
             ...(repeatedPanels.length ? { decisionCheckpoint: `${repeatedPanels.length} comparison panel(s) substantially reuse prior source pixels. Reuse the prior comparison unless a concrete identity or order question remains unresolved.` } : {}),
             note: "Use one panel's viewId. view_pixels and view_normalized refer to this WHOLE comparison canvas; the box must lie inside that panel's displayRect. Source coordinates use coordinateSpace source. Panels may have different display scales." };
@@ -2930,12 +3057,14 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           confidence: Type.Number({ minimum: 0, maximum: 1 }),
           contract: Type.Optional(groundingContractSchema),
           previewOnly: Type.Optional(Type.Boolean({ description: "Optional: return the unsaved proposal overlay and clean contextual pixels for model inspection only. No approval, saving, advancement or evidence-state change. Then submit without this flag for human review." })),
+          boundaryStrips: Type.Optional(Type.Boolean({ description: "Only with previewOnly: add one bounded four-panel image showing pixels on both sides of each proposal edge. Optional for ambiguous boundaries or possibly omitted parts; not required per record." })),
           reason: Type.String({ minLength: 8, maxLength: 800, description: "Direct visible evidence linking the box to the requested object and part; do not cite color alone" }),
           coordinateSpace: Type.Optional(Type.String({ description: "source (default), last_crop, view_pixels or view_normalized. View coordinates refer to the display canvas described by viewId." })),
           viewId: Type.Optional(Type.String({ description: "Required with view_pixels/view_normalized; stable id returned by the current record's view or comparison panel" })),
         }),
         executionMode: "sequential",
         async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+          if (params.boundaryStrips && !params.previewOnly) throw new Error("boundaryStrips requires previewOnly: true; inspect first, then omit both flags for human review.");
           if (params.previewOnly) return previewGroundingResult(params, signal);
           const { summary, overlay, verificationContent, revision, learningSaved, learningWarning } = await saveGroundingResult(params, ctx, signal);
           const requestedLimitReached = requestedRecordLimit !== undefined && sessionSavedCount >= requestedRecordLimit;
@@ -2980,12 +3109,14 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           confidence: Type.Number({ minimum: 0, maximum: 1 }),
           contract: Type.Optional(groundingContractSchema),
           previewOnly: Type.Optional(Type.Boolean({ description: "Optional unsaved proposal inspection only; no human-review dialog, saving or next record. Submit without this flag after inspecting the returned pixels." })),
+          boundaryStrips: Type.Optional(Type.Boolean({ description: "Only with previewOnly: optional four-edge context sheet to inspect clipping, omitted parts or excessive background. Does not change coordinates or save." })),
           reason: Type.String({ minLength: 8, maxLength: 800 }),
           coordinateSpace: Type.Optional(Type.String({ description: "source (default), last_crop, view_pixels or view_normalized; view coordinates require viewId" })),
           viewId: Type.Optional(Type.String()),
         }),
         executionMode: "sequential",
         async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+          if (params.boundaryStrips && !params.previewOnly) throw new Error("boundaryStrips requires previewOnly: true; inspect first, then omit both flags for human review.");
           if (params.previewOnly) return previewGroundingResult(params, signal);
           const { summary: saved, overlay, verificationContent, revision, learningSaved, learningWarning } = await saveGroundingResult(params, ctx, signal, true);
           signal?.throwIfAborted();
@@ -3229,6 +3360,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Use grounding_evidence state.contract for explicit original-query constraints, alternative readings, candidate identity support and source-coordinate ordering before any lock or supported submission. Missing/contradicted evidence cannot create a locked selection or default ok review. The runtime computes geometry only over your declared comparable set; it cannot recognize objects or prove interpretation/candidate completeness. You may submit a best-supported unresolved box for human review without additional color/crop calls. Repeated renders of the same pixels do not increase identity confidence.",
           "Keep the original query and the user's task requirements as the target throughout observation, candidate changes and review. A newly noticed object, working hypothesis or convenient tool result must not silently replace the requested object or drop a required attribute, relation or order. Before submitting a box, reconcile the proposal with every requirement actually present in the request and explain the supporting evidence. If a requirement is unestablished or contradicted, state what is unresolved and use low confidence with status unresolved instead of reinterpreting the query to fit the candidate. Pixel measurements alone do not establish that the request is satisfied.",
           "For continue/status questions, call grounding_status instead of listing directories. If remaining is zero and job.restorationWarning is absent, explain the dataset is complete; do not claim to begin the first record again. If restorationWarning reports incomplete output artifacts, call grounding_next_batch to repair them from approved progress before claiming output completion. For a user-requested correction, find the key in grounding_status and call grounding_reopen_record, then submit the revised box for human review. Do not treat your run's saved predictions as reference annotations.",
+          "grounding_process_image is an optional bounded local measurement aid: compare original visible pixels with only the needed edge/filter/sharpen/contrast/threshold views. Derived appearance is not new identity evidence and may erase or invent boundaries. Panel viewIds retain source geometry; grounding_view recalls the original source region. Skip processing clear boxes and never tune parameters to force a result.",
           "grounding_color_region is an optional local pixel-measurement aid, not a required step for every record or every colored target. First establish object/part identity from the image and context. Use it only when reliable local color contrast helps resolve a remaining boundary question; skip it if the box is clear or color is unhelpful. For unresolved identity, inspect existing evidence or use grounding_view/grounding_compare as needed. Uncertainty is preferable to a forced color match. No extra model or shell/file enumeration is needed.",
           "Color analysis samples only the original visible image; infrared/depth palettes and viewId coordinate mapping do not supply color or alignment evidence. Lighting, shadows, reflections, similar colors, low resolution and occlusion can make a mask misleading. Inspect selectionAssessment, pointSample and clean/mask previews when using it. Measured bounds cover matching pixels only, not necessarily the complete target, and cannot recover hidden boundaries.",
           "Human review is mandatory for every record, including unresolved and low-confidence results. Save tools display the current box and wait for the user to approve it. Never approve on the user's behalf. Only an approved record may be saved or followed by another record; rejection means revise that same record and request review again. Waiting for the user is a valid pause, not an error or a reason to retry.",

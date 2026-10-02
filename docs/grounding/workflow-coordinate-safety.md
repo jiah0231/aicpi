@@ -73,6 +73,47 @@ objects, prove a model's evidence declarations, or establish an accuracy gain.
   outlines and protruding parts. Every result still requires human approval;
   rejection never advances the record. Waiting for review is not inference time.
 
+## Optional original/derived boundary inspection
+
+`grounding_process_image` takes one visible-source ROI, a concrete boundary
+question and 1–3 independent operations. It returns one labeled sheet containing
+the original ROI and only the requested derived panels. Available operations:
+Sobel grayscale edges, Gaussian blur, median filtering, sharpening, midpoint
+contrast and fixed grayscale threshold/binarization. Every operation reads the
+original pixels; operations are not silently chained. No model, detection,
+automatic bbox, external upload or file mutation is involved.
+
+- It is optional after visual identity is established. Clear boxes go directly
+  to review; do not run every operation or sweep thresholds to force an answer
+- Source input is limited to a single still image, 100 million pixels and 64 MB;
+  the extracted ROI is at most 4 million pixels. Sigma is .3–3, median size is
+  3/5/7, contrast gain is .5–3 and threshold is an integer 0–255. Parameters and
+  operation-specific fields are also checked in the executor, not just schemas
+- Every panel retains original visible source dimensions and exact rounded
+  pixel-edge ROI. Returned `viewId` coordinates refer to the whole compressed
+  sheet within that panel's `displayRect`, excluding labels and padding. Sensor
+  registration is not inferred; infrared/depth IDs cannot be used here
+- Derived descriptors retain operation/parameters and `measurement_only`
+  provenance with `establishesObjectIdentity: false`. Processing can invent or
+  erase apparent edges, never establish identity, recover hidden detail or
+  increase confidence by repeating the same pixels. Borders are ROI-local;
+  transparency is composited on white and cannot be treated as object evidence
+- `grounding_view` on a derived ID recalls original pixels in its mapped ROI,
+  not the transformation. A processing call can reproduce the transformation
+- Each loaded record caches at most one bounded encoded sheet for the same
+  source buffer, ROI and resolved parameters. Cache hits still return pixels
+  and fresh IDs: even unarchived images may have left model context under the
+  payload budget. This saves rendering work, not image tokens. Archiving all
+  panel IDs releases the sheet through the existing evidence compaction path
+- Locked-target intersection checks, human-review waits, pending clarification
+  and current-record coordinate ownership remain enforced. This tool neither
+  changes the target box nor saves, advances or approves a record
+
+Regression source covers operation bounds, clean/derived separation, exact
+pixel-edge ROI, independent Sobel/threshold behavior, aborts, panel mapping,
+cache replay after archival, original recall, sensor rejection and both
+clarification gates. These cases have not been executed.
+
 ## Human lesson limits
 
 Version 2 stores only newly human-authored **general procedures**: category,

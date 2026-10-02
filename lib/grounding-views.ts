@@ -29,6 +29,8 @@ export interface GroundingViewDescriptor {
   displayRect?: GroundingViewBox;
   decorations?: "none" | "grid" | "hypothesis" | "all";
   label?: string;
+  /** Geometry remains source-mapped; derived appearance is never identity evidence. */
+  derived?: { kind: "image_processing"; operation: string; role: "measurement_only"; establishesObjectIdentity: false };
 }
 
 function positiveDimension(value: number, name: string): void {
@@ -53,6 +55,7 @@ function cloneDescriptor(view: GroundingViewDescriptor): GroundingViewDescriptor
     ...view,
     region: [...view.region],
     ...(view.displayRect ? { displayRect: [...view.displayRect] as GroundingViewBox } : {}),
+    ...(view.derived ? { derived: { ...view.derived } } : {}),
   };
 }
 
@@ -268,10 +271,66 @@ export interface GroundingComparison {
   panels: Array<{ label: string; rect: GroundingViewBox }>;
 }
 
+export type GroundingOverviewAnnotation = {
+  label: string;
+  region: GroundingViewBox;
+  kind: "roi" | "object";
+};
+
+/** Geometry of declared object boxes only; an inspection ROI is not an object. */
+export function groundingCandidateGeometry(candidates: Array<{ region: GroundingViewBox; bbox?: GroundingViewBox }>, sourceWidth: number, sourceHeight: number) {
+  positiveDimension(sourceWidth, "sourceWidth");
+  positiveDimension(sourceHeight, "sourceHeight");
+  const items = candidates.map((candidate, index) => {
+    validBox(candidate.region, "region");
+    contained(candidate.region, [0, 0, 1, 1], "region");
+    const id = String.fromCharCode(65 + index);
+    if (!candidate.bbox) return { id, region: candidate.region };
+    validBox(candidate.bbox, "bbox");
+    contained(candidate.bbox, [0, 0, 1, 1], "bbox");
+    const [left, top, right, bottom] = candidate.bbox;
+    return { id, region: candidate.region, objectBbox: candidate.bbox,
+      objectCenter: [(left + right) / 2, (top + bottom) / 2] as [number, number],
+      objectSizePixels: [(right - left) * sourceWidth, (bottom - top) * sourceHeight] as [number, number] };
+  });
+  const declared = items.filter((item) => item.objectCenter);
+  const ordered = (axis: number) => [...declared].sort((a, b) => a.objectCenter![axis] - b.objectCenter![axis]).map((item) => item.id);
+  const tied = (axis: number) => declared.flatMap((item, index) => declared.slice(index + 1)
+    .filter((other) => Math.abs(item.objectCenter![axis] - other.objectCenter![axis]) < 1e-12)
+    .map((other) => [item.id, other.id]));
+  return { candidates: items, leftToRight: ordered(0), topToBottom: ordered(1),
+    tiedX: tied(0), tiedY: tied(1), missingObjectBoxes: items.filter((item) => !item.objectCenter).map((item) => item.id),
+    note: "Only model-declared object boxes are sorted. ROI centers, panel/discovery order and magnification are not object rank. Ties have no unique rank. This does not verify identity, completeness or query interpretation." };
+}
+
+/** Four contextual ROIs straddling the proposal; clipping never changes its edges. */
+export function groundingBoundaryRegions(bbox: GroundingViewBox, sourceWidth: number, sourceHeight: number) {
+  validBox(bbox, "bbox");
+  contained(bbox, [0, 0, 1, 1], "bbox");
+  positiveDimension(sourceWidth, "sourceWidth");
+  positiveDimension(sourceHeight, "sourceHeight");
+  const [left, top, right, bottom] = bbox;
+  const dx = Math.max(4 / sourceWidth, (right - left) * 0.12);
+  const dy = Math.max(4 / sourceHeight, (bottom - top) * 0.12);
+  return ([
+    { edge: "top", axis: "y", position: top, requested: [left - dx, top - dy, right + dx, top + dy] },
+    { edge: "bottom", axis: "y", position: bottom, requested: [left - dx, bottom - dy, right + dx, bottom + dy] },
+    { edge: "left", axis: "x", position: left, requested: [left - dx, top - dy, left + dx, bottom + dy] },
+    { edge: "right", axis: "x", position: right, requested: [right - dx, top - dy, right + dx, bottom + dy] },
+  ] as const).map(({ requested, ...item }) => ({ ...item,
+    region: requested.map((value) => Math.max(0, Math.min(1, value))) as GroundingViewBox,
+    contextClipped: requested.some((value) => value < 0 || value > 1),
+    outsideSourcePixels: item.axis === "x"
+      ? (item.edge === "left" ? left : 1 - right) * sourceWidth
+      : (item.edge === "top" ? top : 1 - bottom) * sourceHeight,
+  }));
+}
+
 /** A bounded contact sheet; the per-call panel limit does not limit subsequent views or crops. */
 export async function buildGroundingComparison(
   overview: Buffer,
-  candidates: Array<{ label: string; image: Buffer }>,
+  candidates: Array<{ label: string; image: Buffer; edgeMarker?: { axis: "x" | "y"; fraction: number } }>,
+  annotations: GroundingOverviewAnnotation[] = [],
 ): Promise<GroundingComparison> {
   if (candidates.length < 1 || candidates.length > 4) throw new Error("A comparison accepts 1 to 4 candidates per call; request another comparison for more candidates.");
   const width = 1600;
@@ -300,12 +359,32 @@ export async function buildGroundingComparison(
   }
 
   const overviewRect = await addPanel(overview, "Overview", padding, padding, width - padding * 2, overviewHeight, false);
+  if (annotations.length > 8) throw new Error("At most 8 overview annotations are supported.");
+  const annotationSvg = annotations.map((annotation) => {
+    validBox(annotation.region, "overview annotation");
+    contained(annotation.region, [0, 0, 1, 1], "overview annotation");
+    const [l, t, r, b] = annotation.region;
+    const w = overviewRect[2] - overviewRect[0], h = overviewRect[3] - overviewRect[1];
+    const x = overviewRect[0] + l * w, y = overviewRect[1] + t * h;
+    const color = annotation.kind === "object" ? "#ff9d00" : "#00bde8";
+    return `<g fill="none" stroke="${color}" stroke-width="2"><rect x="${x}" y="${y}" width="${(r - l) * w}" height="${(b - t) * h}" ${annotation.kind === "roi" ? 'stroke-dasharray="5 4"' : ""}/><circle cx="${x + (r - l) * w / 2}" cy="${y + (b - t) * h / 2}" r="3"/></g><text x="${Math.min(x + 2, overviewRect[2] - 60)}" y="${Math.max(overviewRect[1] + 14, y + 14)}" font-size="13" font-family="sans-serif" fill="${color}" stroke="#172033" stroke-width=".5">${escapeXml(annotation.label.slice(0, 80))}</text>`;
+  }).join("");
+  if (annotationSvg) composites.push({ input: Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">${annotationSvg}</svg>`), left: 0, top: 0 });
   const panels: GroundingComparison["panels"] = [];
   for (const [index, candidate] of candidates.entries()) {
     const label = `${String.fromCharCode(65 + index)}: ${candidate.label}`;
     const left = padding + (index % columns) * (cellWidth + gap);
     const top = padding + labelHeight + overviewHeight + gap + Math.floor(index / columns) * (labelHeight + panelHeight + gap);
     const rect = await addPanel(candidate.image, label, left, top, cellWidth, panelHeight, true);
+    if (candidate.edgeMarker) {
+      const { axis, fraction } = candidate.edgeMarker;
+      if (!Number.isFinite(fraction) || fraction < 0 || fraction > 1) throw new Error("Edge marker must lie within its panel's source ROI.");
+      const p = axis === "x" ? rect[0] + fraction * (rect[2] - rect[0]) : rect[1] + fraction * (rect[3] - rect[1]);
+      // Triangles sit outside the pixels; no line hides a thin boundary/part.
+      const points = axis === "x" ? `${p - 4},${rect[1] - 6} ${p + 4},${rect[1] - 6} ${p},${rect[1] - 1}`
+        : `${rect[0] - 6},${p - 4} ${rect[0] - 6},${p + 4} ${rect[0] - 1},${p}`;
+      composites.push({ input: Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><polygon points="${points}" fill="#172033"/></svg>`), left: 0, top: 0 });
+    }
     panels.push({ label, rect });
   }
   const image = await sharp({ create: { width, height, channels: 3, background: "#e8edf3" } })

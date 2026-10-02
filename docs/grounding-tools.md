@@ -70,9 +70,20 @@ source pixels. This feedback is advisory and does not block a needed view.
 
 `grounding_compare` accepts 1–4 labeled source-normalized regions per call and
 returns one image containing the full overview and A/B/C/D detail panels.
-The limit bounds one payload, not total comparisons. Labels are outside the
+The limit bounds one payload, not total comparisons. Detail-panel labels are outside the
 image content. Different panel display scales must not be interpreted as
 different object sizes; use the overview and source regions for those relations.
+
+The comparison overview marks each panel's inspection ROI with a dashed cyan
+outline and its A/B/C/D identifier. An optional `regions[].bbox` declares the
+actual object's source-normalized bounds, shown in orange. The viewing ROI is
+not automatically an object box: it may include background or just one part.
+`sourceGeometry` reports declared object centers and source-pixel sizes,
+left-to-right/top-to-bottom ID order, tied centers and missing object boxes.
+Only explicitly supplied object boxes enter that ordering. These are geometry
+measurements of model declarations, not detections, semantic ranks, proof of
+identity or evidence that every relevant candidate was found. Detail panels
+remain clean; the annotated overview keeps its ordinary source mapping.
 
 Example tool arguments (coordinates are illustrative, not predictions):
 
@@ -134,6 +145,15 @@ coordinates consistently use raw source pixel axes. Pixel-edge roundoff is
 snapped before crop extraction, preventing tiny recalled crops from expanding.
 
 ## Working evidence and color measurements
+
+`grounding_process_image` is an optional local boundary-inspection aid supporting
+`edges`, `blur`, `median`, `sharpen`, `contrast`, and `threshold`. Choose 1–3
+independent operations for one source ROI; the returned sheet keeps the original
+beside the derived views. Each panel has a source-mapped view ID and composite
+display rectangle, so measured coordinates still map to the original source.
+Filters add no source detail and prove neither object identity nor completeness.
+Compare derived boundaries against the original and skip processing when the
+unmodified pixels already answer the question. This is not a required stage.
 
 `grounding_evidence` lists view IDs and accepts `pin`, `unpin`, `archive`,
 `restore`, and a concise `state` with `target`, `facts`, `hypotheses`,
@@ -208,6 +228,22 @@ The reviewed box is the prediction. It is saved exactly as approved, including
 small boxes; no fixed padding or calibration expands it. A magnified verification
 crop may include context around a small approved box, but that preview never
 changes the prediction coordinates.
+
+For a questionable proposal, save tools accept `previewOnly: true` to show an
+unsaved overlay and clean contextual crop without opening review or advancing.
+Optionally add `boundaryStrips: true` to inspect one additional bounded sheet
+of top/bottom/left/right edge context. Small ticks outside each panel mark the
+proposal edge without covering its pixels. Each strip has a view ID, exact
+extracted source region and composite `displayRect`; coordinate mapping uses
+the entire sheet, as with comparisons. `contextClipped` reports any requested
+context clipped at any source boundary, including tangential sides; it does
+not mean no pixels remain beyond the proposal edge. `outsideSourcePixels` gives the distance from that
+proposal edge to the corresponding source edge. The full overview remains on
+the sheet so detached parts can be checked in context. Panel scales differ.
+This optional check helps inspect omitted parts, clipping or excessive
+background; it neither detects them nor changes the proposal. Omit both flags
+to request ordinary human review. `boundaryStrips` without `previewOnly` is
+rejected before review, not silently treated as permission to save.
 
 ## Verification
 
