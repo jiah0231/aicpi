@@ -66,6 +66,14 @@ export const GROUNDING_CONSTRAINT_LIMITS = {
 } as const;
 
 export type GroundingConstraintIssue = { code: string; message: string };
+/** Declared rectangle geometry only, never detected object/foreground coverage. */
+export type GroundingProposalGeometry = {
+  selectedCandidateId: string;
+  proposedBbox: GroundingConstraintBox;
+  selectedBoxCoverage: number;
+  proposalInsideSelectedBox: number;
+  otherCandidateOverlaps: { id: string; candidateBoxCoverage: number; proposalBoxCoverage: number }[];
+};
 export type GroundingOrderAssessment = {
   interpretationId: string;
   axis: GroundingSpatialOrder["axis"];
@@ -89,6 +97,8 @@ export type GroundingConstraintAssessment = {
   requiresHumanReview: true;
   issues: GroundingConstraintIssue[];
   orders: GroundingOrderAssessment[];
+  /** Advisory: overlap is legitimate for occluded objects and never blocks review. */
+  proposalGeometry?: GroundingProposalGeometry;
   selectedCandidate?: {
     id: string;
     sourceBbox: GroundingConstraintBox;
@@ -271,6 +281,31 @@ const ORDER_EPSILON = 1e-6;
 const establishedIdentity = (candidate: GroundingConstraintCandidate) => candidate.identity.status === "supported"
   && candidate.identity.basis === "visual_structure";
 
+export function assessGroundingProposalGeometry(
+  candidates: readonly GroundingConstraintCandidate[],
+  selectedCandidateId: string | undefined,
+  proposedBbox: readonly number[],
+): GroundingProposalGeometry | undefined {
+  const selected = candidates.find((candidate) => candidate.id === selectedCandidateId);
+  if (!selected) return undefined;
+  const proposed = box(proposedBbox, "selectionBbox");
+  const area = (bbox: readonly number[]) => (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]);
+  const intersection = (bbox: readonly number[]) => Math.max(0, Math.min(proposed[2], bbox[2]) - Math.max(proposed[0], bbox[0]))
+    * Math.max(0, Math.min(proposed[3], bbox[3]) - Math.max(proposed[1], bbox[1]));
+  const selectedIntersection = intersection(selected.bbox);
+  return {
+    selectedCandidateId: selected.id, proposedBbox: proposed,
+    selectedBoxCoverage: selectedIntersection / area(selected.bbox),
+    proposalInsideSelectedBox: selectedIntersection / area(proposed),
+    otherCandidateOverlaps: candidates.filter((candidate) => candidate.id !== selected.id)
+      .flatMap((candidate) => {
+        const overlap = intersection(candidate.bbox);
+        return overlap > 0 ? [{ id: candidate.id, candidateBoxCoverage: overlap / area(candidate.bbox),
+          proposalBoxCoverage: overlap / area(proposed) }] : [];
+      }),
+  };
+}
+
 /** Deterministic ordering of a validated contract; no image recognition or language parsing. */
 export function assessGroundingSpatialOrder(
   order: GroundingSpatialOrder,
@@ -389,6 +424,9 @@ export function assessGroundingConstraints(
   return {
     status: contradicted ? "contradicted" : issues.length ? "unresolved" : "supported",
     canLock: issues.length === 0, requiresHumanReview: true, issues, orders, limitations,
+    ...(selected && selectionBbox !== undefined ? {
+      proposalGeometry: assessGroundingProposalGeometry(contract.candidates, selected.id, selectionBbox),
+    } : {}),
     ...(selected ? { selectedCandidate: { id: selected.id, sourceBbox: [...selected.bbox] as GroundingConstraintBox, identityStatus: selected.identity.status } } : {}),
   };
 }

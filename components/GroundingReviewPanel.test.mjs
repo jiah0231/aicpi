@@ -195,3 +195,13 @@ test("preview issues and boundary reminder do not add an approval or learning ga
   assert.equal(source.match(/type="checkbox"/g)?.length, 4);
   assert.ok(source.indexOf('aria-label="Boundary detail preview"') < source.indexOf("onClick={confirm}"));
 });
+
+test("proposal geometry follows editable coordinates and remains explicitly advisory", () => {
+  assert.match(source, /const proposalGeometry = isValidBbox\(bbox\) && details\.modelContract/);
+  assert.match(source, /assessGroundingProposalGeometry\(details\.modelContract\.candidates, details\.modelContract\.selectedCandidateId, bbox\)/);
+  assert.match(source, /proposalGeometry\.selectedBoxCoverage/);
+  assert.match(source, /proposalGeometry\.proposalInsideSelectedBox/);
+  assert.match(source, /proposalGeometry\.otherCandidateOverlaps/);
+  assert.match(source, /遮挡可正常重叠/);
+  assert.match(source, /声明框本身错误也可能显示 100%/);
+});

@@ -200,7 +200,11 @@ export function compactGroundingEvidence(
     }
   }
   const overflow = bounded && total > budget!;
-  const warningIndex = overflow ? messages.findLastIndex((message) => message.role === "toolResult" && message.toolName.startsWith("grounding_")) : -1;
+  // One informational notice belongs to the latest visual observation, not
+  // each subsequent notebook/list response. A text-only evidence call cannot
+  // manufacture a fresh warning result and invite another cleanup round.
+  const warningIndex = overflow ? messages.findLastIndex((message) => message.role === "toolResult"
+    && message.toolName.startsWith("grounding_") && message.content.some((block) => block.type === "image")) : -1;
   const byMessage = new Map<number, Entry[]>();
   for (const entry of entries) {
     if (!entry.removed) continue;
@@ -221,7 +225,7 @@ export function compactGroundingEvidence(
       }
       return [`Grounding image omitted by the visual working-set request-size limit: ${entry.ids.join(", ")}. Its pixels are unavailable in this request; saved text is not visual proof. Do not reopen it merely to repeat an already resolved check. Preserve uncertainty if required evidence is missing.`];
     });
-    if (index === warningIndex) notices.push(`Grounding evidence capacity warning: retained image base64 uses ${total} characters, above the ${budget} image allowance. Required/current/original evidence and unowned images were not silently discarded or resized. This request may still exceed the provider limit (text, tools and envelopes are additional). Reduce the working set explicitly or use a larger-capacity provider; do not claim lossless budget compliance.`);
+    if (index === warningIndex) notices.push(`Grounding evidence capacity warning (informational): retained image base64 uses ${total} characters, above the ${budget} soft image allowance. The runtime manages this working set and has preserved required/current/original evidence and unowned images without resizing. No grounding_evidence, pin, unpin, archive, reopen or provider-change action is needed solely for this notice; continue the visual task using available evidence. The allowance is not a provider-body limit (text, tools and envelopes are additional). An actual provider rejection is a separate error, not established by this notice.`);
     if (notices.length) content.push({ type: "text", text: notices.join("\n") });
     if (!content.length) content.push({ type: "text", text: `Grounding evidence images archived from active context: ${removed.flatMap((entry) => entry.ids).join(", ")}.` });
     return { ...message, content };

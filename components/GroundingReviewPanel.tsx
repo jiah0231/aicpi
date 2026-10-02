@@ -3,6 +3,7 @@
 
 import { useMemo, useRef, useState } from "react";
 import { validateGroundingReviewLearning } from "@/lib/grounding-learning-validation";
+import { assessGroundingProposalGeometry } from "@/lib/grounding-constraints";
 import type {
   ExtensionUiRequest,
   GroundingLearningCategory,
@@ -96,6 +97,11 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
   const [reason, setReason] = useState(details.reason);
   const [constraintsResolved, setConstraintsResolved] = useState(false);
   const unresolvedChecks = details.constraintAssessment !== undefined && !details.constraintAssessment.canLock;
+  // Recompute against the editable box; never label the original proposal's
+  // measurements as measurements of the reviewer's replacement coordinates.
+  const proposalGeometry = isValidBbox(bbox) && details.modelContract
+    ? assessGroundingProposalGeometry(details.modelContract.candidates, details.modelContract.selectedCandidateId, bbox)
+    : undefined;
   const [rejectionReason, setRejectionReason] = useState("");
   const [learningCategory, setLearningCategory] = useState<GroundingLearningCategory>("other");
   const [learningApplicability, setLearningApplicability] = useState("");
@@ -382,6 +388,13 @@ export function GroundingReviewPanel({ request, onInput }: Props) {
                     支持 / 可能候选 {order.supportedCount} / {order.possibleCount}；所选 {order.selectedCandidateId} 排名 {order.selectedRank ?? "未确定"}
                   </div>
                 ))}
+                {proposalGeometry && <div>
+                  当前框与模型声明的候选框（不是物体识别）：覆盖所选 {proposalGeometry.selectedCandidateId} 框 {(proposalGeometry.selectedBoxCoverage * 100).toFixed(1)}%；当前框 {(proposalGeometry.proposalInsideSelectedBox * 100).toFixed(1)}% 位于所选框内。
+                  {proposalGeometry.otherCandidateOverlaps.length > 0 && <div>
+                    与其他声明框重叠：{proposalGeometry.otherCandidateOverlaps.map((item) => `${item.id}（其框 ${(item.candidateBoxCoverage * 100).toFixed(1)}%，当前框 ${(item.proposalBoxCoverage * 100).toFixed(1)}%）`).join("；")}。
+                  </div>}
+                  <div>请对照全图核对计数对象、所选身份与完整轮廓，排除误包邻近物体或空地。遮挡可正常重叠；这些比例不判定对错，声明框本身错误也可能显示 100%。</div>
+                </div>}
                 {details.modelContract && <details>
                   <summary>模型声明的候选、原文约束与不同解读</summary>
                   {details.modelContract.candidates.map((candidate) => <div key={candidate.id}>

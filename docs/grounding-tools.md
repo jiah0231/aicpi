@@ -175,12 +175,19 @@ unmodified pixels already answer the question. This is not a required stage.
 `restore`, and a concise `state` with `target`, `facts`, `hypotheses`,
 `openQuestions`, and `ruledOut`. `facts` contain direct visible observations.
 Object and body-part interpretations remain in `hypotheses` until visible
-structure supports them; a color match cannot promote one to a fact. The model
-decides which evidence is superseded; there is no automatic
-last-N deletion. Only explicitly archived image blocks leave later provider
-input. Original full-record evidence, user corrections, signed thinking and
-tool-call/result pairs remain. A multi-panel image is omitted only when all
-of its view IDs are archived; pinning takes precedence. The on-disk transcript
+structure supports them; a color match cannot promote one to a fact. The runtime manages the visual working set; notebook or archive calls are not
+needed merely to satisfy the soft image allowance. It can omit eligible older
+image blocks and deduplicate exact copies only while matching pixels remain.
+Essential evidence can exceed that allowance without being silently discarded.
+An informational capacity warning is not a provider rejection or a cleanup task.
+`pinned` denotes an explicit pin. `protected`/`protectionReason` identify original
+sensor overviews that cannot be removed by unpin/archive. `archiveResults` and
+`unpinResults` state whether requested view-state changes took effect, not how
+many bytes were freed; a shared composite stays while another panel is retained.
+Archival is deferred while an explicit pin remains. Archive only for a genuine evidence decision,
+not a budget-maintenance round. A composite image is indivisible. User corrections,
+signed thinking and tool-call/result pairs remain.
+The on-disk transcript
 is not rewritten. View IDs and active evidence selections are wrapper-local;
 the concise evidence state and current box survive a wrapper restart.
 

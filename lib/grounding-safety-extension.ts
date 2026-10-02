@@ -2477,7 +2477,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           ...(boundaryOverview ? { boundaryOverview, boundaryStrips: boundaryViews,
             boundaryNote: "Optional four-edge context check. Outside-panel ticks mark the proposed edge without covering image pixels. Inspect complete visible parts and background on both sides; panels have different display scales. contextClipped means part of the requested context was clipped at any source boundary, not necessarily this proposal edge. outsideSourcePixels is the distance from this proposal edge to its corresponding source edge; zero means no further pixels on that side. These views never adjust the proposal or establish identity." } : {}),
           nextAction: "inspect_preview_then_request_review",
-          note: "UNSAVED proposal on this record's visible image, followed by clean contextual pixels. Inspect whether the box actually contains the requested object and its complete boundaries. Correct mistaken coordinates/identity; unsupported evidence stays unresolved. Then call the save tool without previewOnly for human review. This rendering establishes no object identity and does not advance the job." };
+          note: "UNSAVED proposal on this record's visible image, followed by clean contextual pixels. Audit against the source overview: the query-defined counting set and rank, selected identity, complete requested silhouette, and unintended neighboring objects or empty ground. proposalGeometry reports declared rectangle overlaps only; occlusion can legitimately overlap, and a wrong declared candidate box can match perfectly. Correct mistaken coordinates/identity; unsupported evidence stays unresolved. Then call the save tool without previewOnly for human review. This rendering establishes no object identity and does not advance the job." };
         return { content: [{ type: "text" as const, text: JSON.stringify(details) }, ...proposal.content, ...clean.content, ...boundaryContent], details };
       };
 
@@ -2794,7 +2794,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Missing or unresolved contracts stay reviewable as unresolved at low confidence; no extra color/crop call is required. Unsupported locks are returned as reconsidering with explicit constraintAssessment issues. Fix only what current evidence supports; never fabricate evidence to clear a check.",
           "If the referent or requested rank cannot be established and there is no concrete remaining visual check, pass clarification with one specific question for the user. This ends the current run and waits on the same unsaved record without requiring a box. A real user response releases the wait; it never approves, saves or advances. Use ordinary unresolved human review instead when a best-supported proposal is useful.",
           "As soon as identity and every required order/relation are established, set state.selection to locked with a rough source-normalized bbox and direct evidence. Locked means no identity or rank check remains; it is not a tentative pick. This limits later views to target boundary measurement. Use reconsidering while comparison is still needed or after naming new visible counterevidence; a generic possibility of hidden candidates is not counterevidence.",
-          "Archive only superseded or redundant views after keeping evidence and counterexamples that matter. Up to 8 explicit pins retain important counterevidence; unpin superseded views in the same call. Original sensor overviews and the current working set are retained automatically. Independent image blocks archive separately; a composite sheet requires all panel IDs. Required pixels above the image allowance produce a capacity warning, not silent loss.",
+          "Archive only superseded or redundant views after keeping evidence and counterexamples that matter. Up to 8 explicit pins retain important counterevidence; unpin superseded views in the same call. Original sensor overviews are protected automatically, independently of explicit pins; unpin/archive cannot remove them. Capacity is runtime-managed: never make notebook or archive calls merely to satisfy an image allowance. Independent image blocks archive separately; a composite sheet requires all panel IDs. Informational capacity warnings do not request cleanup or establish a provider rejection.",
         ],
         parameters: Type.Object({
           key: Type.Optional(Type.String()),
@@ -2841,8 +2841,31 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           for (const id of params.unpin ?? []) nextPins.delete(id);
           for (const id of params.pin ?? []) nextPins.add(id);
           if (nextPins.size > GROUNDING_MAX_PINNED_VIEWS) throw new Error(`At most ${GROUNDING_MAX_PINNED_VIEWS} views can be explicitly pinned. Unpin superseded views in the same call before adding important counterevidence. No pins or evidence state were changed.`);
+          const originalOverviews = new Set(loaded.overviewViewIds.values());
+          const unpinResults = (params.unpin ?? []).map((viewId) => ({ viewId,
+            changed: loaded.pinnedViewIds.has(viewId) && !nextPins.has(viewId),
+            reason: nextPins.has(viewId) ? "explicit_pin_retained" : originalOverviews.has(viewId)
+              ? "original_overview_remains_protected" : loaded.pinnedViewIds.has(viewId) ? "explicit_pin_removed" : "not_explicitly_pinned" }));
+          const previousPins = loaded.pinnedViewIds;
           loaded.pinnedViewIds = nextPins;
-          for (const id of params.archive ?? []) loaded.archivedViewIds.add(id);
+          // Protected overviews cannot be archived through notebook controls.
+          // Do not store a fictitious archive intent for them, including stale
+          // intents accepted by older wrappers. Unpin controls explicit pins.
+          for (const id of originalOverviews) loaded.archivedViewIds.delete(id);
+          const archiveResults = (params.archive ?? []).map((viewId) => {
+            if (originalOverviews.has(viewId)) return { viewId, changed: false, archived: false,
+              reason: "original_overview_protected" };
+            if (params.restore?.includes(viewId)) return { viewId, changed: false, archived: false,
+              reason: "restore_takes_precedence_in_same_call" };
+            // A stored archive intent was not exposed as archived while an
+            // explicit pin held it. Report the effective view-state change
+            // when this same call unpins and completes that deferred archive.
+            const wasArchived = loaded.archivedViewIds.has(viewId) && !previousPins.has(viewId);
+            loaded.archivedViewIds.add(viewId);
+            if (nextPins.has(viewId)) return { viewId, changed: false, archived: false,
+              reason: "deferred_by_explicit_pin" };
+            return { viewId, changed: !wasArchived, archived: true, reason: wasArchived ? "already_archived" : "archived" };
+          });
           for (const id of params.restore ?? []) loaded.archivedViewIds.delete(id);
 
           loaded.workingState = state;
@@ -2865,14 +2888,15 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           }
           const all = loaded.views.list();
           const offset = params.offset ?? 0;
-          const originalOverviews = new Set(loaded.overviewViewIds.values());
           const views = all.slice(offset, offset + (params.limit ?? 20)).map((view) => ({ ...view,
-            pinned: loaded.pinnedViewIds.has(view.id) || originalOverviews.has(view.id),
+            pinned: loaded.pinnedViewIds.has(view.id), protected: originalOverviews.has(view.id),
+            ...(originalOverviews.has(view.id) ? { protectionReason: "original_overview" } : {}),
             originalOverview: originalOverviews.has(view.id), explicitlyPinned: loaded.pinnedViewIds.has(view.id),
             archived: loaded.archivedViewIds.has(view.id) && !loaded.pinnedViewIds.has(view.id) && !originalOverviews.has(view.id) }));
           const details = { key, ...groundingTargetReminder(loaded), state: state ?? {}, constraintAssessment, lockDeferred, views, totalViews: all.length,
             nextOffset: offset + views.length < all.length ? offset + views.length : null,
-            note: "Facts are direct observations; hypotheses are unverified object/part interpretations. A selected target limits later views to its region; set selection to reconsidering only when new visible counterevidence requires reopening identity. Color membership never establishes identity. Explicit archival and visual working-set limits may omit individual image blocks; identical pixels may be referenced where still retained. Original sensor overviews, latest per-modality observations, current candidate and explicit counterevidence pins are prioritized. A capacity warning means required pixels exceed the image allowance, not that the provider payload is within its limit. Do not reopen views just to repeat resolved checks." };
+            ...(params.archive?.length ? { archiveResults } : {}), ...(params.unpin?.length ? { unpinResults } : {}),
+            note: "Facts are direct observations; hypotheses are unverified object/part interpretations. A selected target limits later views to its region; set selection to reconsidering only when new visible counterevidence requires reopening identity. Color membership never establishes identity. Explicit archival and visual working-set limits may omit individual image blocks; identical pixels may be referenced where still retained. Original sensor overviews, latest per-modality observations, current candidate and explicit counterevidence pins are prioritized. pinned means explicit pin; protected original overviews remain regardless of unpin/archive. archiveResults and unpinResults report view-state changes, not freed bytes; a shared composite stays while another panel is retained. Capacity is managed by the runtime: no notebook or archive call is needed solely for an informational allowance warning, which does not establish a provider rejection. Do not reopen views just to repeat resolved checks." };
           return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
         },
       });
@@ -2885,7 +2909,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Set regions[i].modality for each sensor (defaults to top-level modality, then visible). Generated labels name actual sensors. A single comparison can include visible/infrared/depth panels with independent source regions; never infer registration or cross-sensor rank. The overview shows the first panel sensor only.",
           "Use overview for relations between candidates and detail panels for local parts. Every panel label is outside its pixels; different panel scales must not be used to compare real object size. You may call again with more candidates; the 4-panel limit bounds one image only.",
           "The overview marks inspection ROIs with dashed cyan outlines and optional declared object bboxes with solid orange outlines. Supply bbox only when you can identify the object's extent; region is viewing context, not an object box. sourceGeometry sorts only supplied object centers, reports missing boxes/ties, and does not establish identity or complete scene membership.",
-          "For ordinal queries, establish which candidates satisfy the object description, then order them along the requested axis and direction in a common source-image frame. Panel labels and discovery order are not spatial rank. Recompute the order when a candidate is added, removed or reidentified; do not invent a candidate to satisfy the requested number.",
+          "For ordinal queries, preserve the counting set specified by the original wording; do not silently filter it by qualifiers that describe only the selected target. Order that set along the requested axis and direction in a common source-image frame. Panel labels and discovery order are not spatial rank. Recompute the order when a candidate is added, removed or reidentified; do not invent a candidate to satisfy the requested number.",
         ],
         parameters: Type.Object({
           key: Type.Optional(Type.String()), queryPath: Type.Optional(Type.String()),
@@ -3512,10 +3536,10 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "When estimating a box inside the last focus crop, pass coordinateSpace last_crop to the save tool instead of manually converting it to full-image coordinates.",
           "Prefer stable viewId plus coordinateSpace view_pixels or view_normalized to manually converting display coordinates. For comparison panels, coordinates refer to the whole composite canvas; the box must be within the chosen panel.",
           "Use grounding_compare to compare candidate identities together with full-image context. Panel magnification does not indicate source object size. grounding_view decorations none returns clean pixels without boxes, grids or labels; bbox is optional during identity selection.",
-          "For ordinal queries such as third from the left, establish which visible candidates match the requested object, then sort their positions along the specified axis and direction in the same source-image frame. Objects beyond the selected rank on the irrelevant side cannot change that rank. Do not search empty quadrants for an object merely because one could be hidden; only an actual ambiguous shape or occlusion is grounds for another candidate view. Recompute spatial order when visible evidence adds, removes or reidentifies a candidate. If the candidate count or order is unsupported, keep the target unresolved instead of inventing an object to satisfy the numeral. The review reason should explain the supported count and order.",
+          "For ordinal queries such as third from the left, preserve the original query-defined counting set separately from qualifiers describing only the selected target; an explicitly filtered set still applies. Sort that set along the specified axis and direction in the same source-image frame. Objects beyond the selected rank on the irrelevant side cannot change that rank. Do not search empty quadrants for an object merely because one could be hidden; only an actual ambiguous shape or occlusion is grounds for another candidate view. Recompute spatial order when visible evidence adds, removes or reidentifies a candidate. If the candidate count or order is unsupported, keep the target unresolved instead of inventing an object to satisfy the numeral. The review reason should explain the supported count and order.",
           "Across visible, infrared and depth, equal image dimensions do not establish spatial registration or object correspondence. View coordinate mappings do not align sensors. Verify correspondence before transferring a box into the visible review image; conflicting positions or structure are unresolved evidence, not identity confirmation. If identity, requested rank or cross-modal correspondence remains unresolved, use status unresolved with low confidence and explain the missing evidence rather than reporting ok.",
           "Separate target identity, part selection and boundary measurement. Color membership is not object identity: point no_match does not prove absence and largest can be background. Do not invent thermal properties to justify an infrared interpretation.",
-          "Keep a short factual state with grounding_evidence (target, facts, hypotheses, openQuestions, ruledOut, selection). Facts are direct visible observations. Put interpretations such as 'the nearby dark line is the beak' in hypotheses until structure verifies both the object and part. A generic possibility that another target may be hidden is not an open question. Pin important views; archive redundant images when they add no evidence.",
+          "Keep a short factual state with grounding_evidence (target, facts, hypotheses, openQuestions, ruledOut, selection). Facts are direct visible observations. Put interpretations such as 'the nearby dark line is the beak' in hypotheses until structure verifies both the object and part. A generic possibility that another target may be hidden is not an open question. Pin important counterevidence only when useful; archive redundant images only for an evidence decision, never merely to satisfy a capacity warning. The runtime manages image capacity; protected original overviews cannot be unpinned or archived.",
           "Every additional view should resolve a specific remaining question. Repeated zoom of the same source pixels cannot add texture. Preserve unresolved alternatives instead of restarting all guesses. A request to analyze past mistakes does not itself request new annotation.",
           "When the observed count is below the requested rank, do not promote the last visible object or keep searching for hypothetical hidden members. Further inspection needs a concrete observed ambiguity. If no useful visual check remains and a referent needs clarification, call grounding_evidence with clarification set to one concrete question; the same unsaved record waits for actual user input without requiring a bbox or automatic continuation. A useful best-supported proposal may instead use ordinary unresolved human review.",
           "Use grounding_save_and_next between requested records and grounding_save_result for the final record or revision. Each save requires a reason naming visible structural evidence for the chosen identity, part and boundaries. If the proposed box materially moves from the prior candidate, explain the new visible evidence before submitting it. If save_result returns nextAction grounding_next_batch, continue that same job.",

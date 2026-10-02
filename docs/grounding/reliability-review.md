@@ -14,6 +14,12 @@ If the contract is incomplete, a best-supported tentative box can still reach ma
 
 Repeated views, magnification and color-only pixel measurements do not establish identity. Color measurement remains optional and is intended for an already visually identified target's boundary. There is no requirement to invoke it on each record. These checks cannot detect a model falsely claiming structural visual evidence or guarantee that an apparently supported box encloses the correct object.
 
+### Proposal geometry advisory
+
+The existing assessment, optional preview and human review expose `proposalGeometry`: how much of the declared selected rectangle the proposal covers, how much of the proposal lies inside it, and overlaps with other declared candidate rectangles. The review panel recomputes these numbers when the human edits the box. These are rectangle-area ratios, not foreground coverage or detected object counts. They never block legitimate occlusion, part refinement or approval, and introduce no required call or contract field. A wrong declared candidate box can match the proposal at 100%; geometry cannot detect a fence mislabeled as a bird or an omitted candidate.
+
+Ordering must preserve the counting set in the original wording, separately from qualifiers describing the selected target. An explicitly filtered counting set is still respected. Use the retained overview to audit count/rank and identity, then check that the proposal encloses the requested silhouette without unintended neighbors or empty ground. Existing optional preview supports this audit; it is not a mandatory extra round.
+
 ## View coordinates
 
 - Recall the same region: `viewId` without `region`
