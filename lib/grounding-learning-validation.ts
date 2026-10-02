@@ -42,3 +42,13 @@ export function validateGroundingReviewLearning(value: unknown): GroundingReview
   return { category: input.category as GroundingLearningCategory, ...fields, sampleIndependent: true };
 }
 
+
+/** Lexical rejection only; human review remains the semantic boundary. */
+export function validateGenericLearningText(value: unknown, minimum = 8, maximum = 2400): string {
+  if (typeof value !== "string") throw new Error("Generic learning text is required.");
+  const text = value.replace(/\r\n?/g, "\n").trim();
+  if (text.length < minimum || text.length > maximum || SAMPLE_PAYLOAD.test(text)) {
+    throw new Error("Generic learning text is invalid or contains apparent sample data. Remove original or paraphrased sample content; no automatic anonymization is performed.");
+  }
+  return text;
+}
