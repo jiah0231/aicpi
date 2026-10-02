@@ -17,6 +17,7 @@ import sharp from "sharp";
 import { Type } from "typebox";
 import type { GroundingReviewDetails, GroundingReviewResponse } from "./types";
 import { analyzeGroundingColor } from "./grounding-color";
+import { proposeGroundingContours, validateGroundingContourOptions } from "./grounding-contours";
 import { processGroundingImage, validateGroundingImageOperations, type GroundingImageOperation } from "./grounding-image-processing";
 import { buildGroundingComparison, groundingCandidateGeometry, groundingBoundaryRegions, GroundingViewRegistry, type GroundingViewDescriptor } from "./grounding-views";
 import { compactGroundingEvidence, validateGroundingWorkingState, type GroundingWorkingState } from "./grounding-evidence";
@@ -46,6 +47,7 @@ const GROUNDING_TOOL_NAMES = [
   "grounding_evidence",
   "grounding_color_region",
   "grounding_process_image",
+  "grounding_refine_box",
   "grounding_status",
   "grounding_reopen_record",
   "grounding_save_result",
@@ -2604,6 +2606,66 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       });
 
       pi.registerTool({
+        name: "grounding_refine_box",
+        label: "Grounding edge candidate boxes",
+        description: "Optional local Canny-like edge measurement around a visually identified target's coarse box. Returns up to three connected-edge candidate bounds with clean original, edge and candidate-overlay panels. Not object detection, filled segmentation, identity confidence or automatic annotation. No models, remote image upload or file writes.",
+        promptGuidelines: [
+          "Use only for a concrete remaining boundary question. Inputs are full visible-source normalized coordinates, never display or sensor coordinates. region must contain coarseBox with context. Optional point filters component bounding rectangles only; it does not establish foreground membership.",
+          "At most 1 million ROI pixels, 100 million source pixels/64 MB, 4096 components and 3 returned candidates. No analysis downsampling. Fixed mild blur, gradient thinning and hysteresis; low/high thresholds default 20/50 in gradient-magnitude units. Do not sweep parameters to force a result.",
+          "Compare candidate bounds with original pixels and preserve visible tails/protrusions. Disconnected parts are not merged; edge components need not be closed or complete objects. rankScore is coarse-box agreement with a border penalty, not confidence. No largest-component default, automatic target choice or approval. Use ordinary save review after choosing a visually supported proposal.",
+        ],
+        parameters: Type.Object({
+          key: Type.Optional(Type.String()), queryPath: Type.Optional(Type.String()),
+          region: Type.Array(Type.Number(), { minItems: 4, maxItems: 4, description: "Full visible-source normalized search ROI containing coarseBox" }),
+          coarseBox: Type.Array(Type.Number(), { minItems: 4, maxItems: 4, description: "Full visible-source normalized rough target bounds" }),
+          point: Type.Optional(Type.Array(Type.Number(), { minItems: 2, maxItems: 2, description: "Optional source point inside coarseBox; tests candidate bounds only" })),
+          lowThreshold: Type.Optional(Type.Number({ minimum: 1, maximum: 255 })),
+          highThreshold: Type.Optional(Type.Number({ minimum: 1, maximum: 255 })),
+          reason: Type.String({ minLength: 8, maxLength: 400 }),
+        }),
+        executionMode: "sequential",
+        async execute(_id, params, signal) {
+          signal?.throwIfAborted();
+          const [key, loaded] = resolveLoadedRecord(params);
+          if (savingRecord) throw new Error("Wait for the current human review before refining a box.");
+          if (typeof params.reason !== "string" || params.reason.trim().length < 8 || params.reason.length > 400) throw new Error("Explain the boundary question in 8–400 characters.");
+          if ("viewId" in params || "coordinateSpace" in params) throw new Error("grounding_refine_box accepts full visible-source coordinates only; map view coordinates first.");
+          const contourOptions = validateGroundingContourOptions(params);
+          const checkLocked = () => {
+            const selected = loaded.workingState?.selection?.status === "locked" ? loaded.workingState.selection.bbox : undefined;
+            if (selected && !boxesIntersect(selected, contourOptions.coarseBox)) throw new Error("Refine the locked target. To reopen identity, first record visible counterevidence with selection reconsidering.");
+          };
+          checkLocked();
+          const source = await readRecordImage(loaded.sourcePath, loaded.record, "visible");
+          const { image, ...result } = await proposeGroundingContours(source.bytes, contourOptions, signal);
+          const encoded = await encodeGroundingPreview(image, "image/png");
+          signal?.throwIfAborted();
+          if (resolveLoadedRecord(params)[1] !== loaded || savingRecord) throw new Error("Record or human-review state changed during refinement; inspect the current record again.");
+          checkLocked();
+          const panels = result.panels.map((panel) => {
+            const input: Omit<GroundingViewDescriptor, "id"> = {
+              modality: "visible", region: result.region, sourceWidth: result.sourceWidth, sourceHeight: result.sourceHeight,
+              width: encoded.width, height: encoded.height, decorations: panel.overlay ? "hypothesis" : "none", label: panel.label,
+              displayRect: [panel.rect[0] * encoded.width / result.width, panel.rect[1] * encoded.height / result.height,
+                panel.rect[2] * encoded.width / result.width, panel.rect[3] * encoded.height / result.height],
+              ...(panel.derived ? { derived: { kind: "image_processing" as const, operation: JSON.stringify({ kind: "edge_candidates", panel: panel.overlay ? "proposal_overlay" : "edges", ...result.options }), role: "measurement_only" as const, establishesObjectIdentity: false as const } } : {}),
+            };
+            const sourceReuse = loaded.views.sourceReuse(input);
+            return { ...loaded.views.register(input), ...(sourceReuse ? { sourceReuse } : {}) };
+          });
+          const details = { key, ...groundingTargetReminder(loaded), modality: "visible", source: source.label,
+            role: "measurement_only", establishesObjectIdentity: false, requiresHumanReview: true, saved: false,
+            region: result.region, regionPixels: result.regionPixels, options: result.options,
+            sourceWidth: result.sourceWidth, sourceHeight: result.sourceHeight,
+            candidates: result.candidates, status: result.status, componentsTruncated: result.componentsTruncated,
+            panels, evidenceViewIds: panels.map(panel => panel.id), warnings: result.warnings, reason: params.reason,
+            note: "All candidate boxes are full visible-source normalized pixel edges. Panel coordinates refer to the whole sheet within displayRect. No candidate is selected, locked, saved or approved. Derived view recall shows original pixels. Same-source rerenders are not independent support." };
+          return { content: [{ type: "text" as const, text: JSON.stringify(details) },
+            { type: "image" as const, data: encoded.data, mimeType: encoded.mimeType }], details };
+        },
+      });
+
+      pi.registerTool({
         name: "grounding_color_region",
         label: "Grounding local color analysis",
         description: "Optional deterministic pixel measurement for a visually identified target or part whose color reliably contrasts with its surroundings and whose boundary needs measurement. Not a default step for every record: skip it when color is unhelpful or the box is already clear. Analyzes only original visible-image pixels in a chosen local region; returns source-normalized color-component bounds, an optional point sample, clean crop and mask preview. It cannot identify the target, recover hidden boundaries, or save a result.",
@@ -3360,6 +3422,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Use grounding_evidence state.contract for explicit original-query constraints, alternative readings, candidate identity support and source-coordinate ordering before any lock or supported submission. Missing/contradicted evidence cannot create a locked selection or default ok review. The runtime computes geometry only over your declared comparable set; it cannot recognize objects or prove interpretation/candidate completeness. You may submit a best-supported unresolved box for human review without additional color/crop calls. Repeated renders of the same pixels do not increase identity confidence.",
           "Keep the original query and the user's task requirements as the target throughout observation, candidate changes and review. A newly noticed object, working hypothesis or convenient tool result must not silently replace the requested object or drop a required attribute, relation or order. Before submitting a box, reconcile the proposal with every requirement actually present in the request and explain the supporting evidence. If a requirement is unestablished or contradicted, state what is unresolved and use low confidence with status unresolved instead of reinterpreting the query to fit the candidate. Pixel measurements alone do not establish that the request is satisfied.",
           "For continue/status questions, call grounding_status instead of listing directories. If remaining is zero and job.restorationWarning is absent, explain the dataset is complete; do not claim to begin the first record again. If restorationWarning reports incomplete output artifacts, call grounding_next_batch to repair them from approved progress before claiming output completion. For a user-requested correction, find the key in grounding_status and call grounding_reopen_record, then submit the revised box for human review. Do not treat your run's saved predictions as reference annotations.",
+          "grounding_refine_box optionally measures connected-edge candidate boxes around a source-normalized coarseBox inside region. Compare its clean original, derived edges and candidate overlay; rankScore is geometric agreement, never identity confidence. It does not fill objects, merge detached parts, establish complete contours or change a target. Keep tails/protrusions and uncertainty; ordinary human review remains mandatory.",
           "grounding_process_image is an optional bounded local measurement aid: compare original visible pixels with only the needed edge/filter/sharpen/contrast/threshold views. Derived appearance is not new identity evidence and may erase or invent boundaries. Panel viewIds retain source geometry; grounding_view recalls the original source region. Skip processing clear boxes and never tune parameters to force a result.",
           "grounding_color_region is an optional local pixel-measurement aid, not a required step for every record or every colored target. First establish object/part identity from the image and context. Use it only when reliable local color contrast helps resolve a remaining boundary question; skip it if the box is clear or color is unhelpful. For unresolved identity, inspect existing evidence or use grounding_view/grounding_compare as needed. Uncertainty is preferable to a forced color match. No extra model or shell/file enumeration is needed.",
           "Color analysis samples only the original visible image; infrared/depth palettes and viewId coordinate mapping do not supply color or alignment evidence. Lighting, shadows, reflections, similar colors, low resolution and occlusion can make a mask misleading. Inspect selectionAssessment, pointSample and clean/mask previews when using it. Measured bounds cover matching pixels only, not necessarily the complete target, and cannot recover hidden boundaries.",
