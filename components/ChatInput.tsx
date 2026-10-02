@@ -2496,6 +2496,9 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                         </button>
                       );
                     })}
+                    <div style={{ maxWidth: 280, padding: "8px 12px", borderTop: "1px solid var(--border)", color: "var(--text-dim)", fontSize: 11, lineHeight: 1.5 }}>
+                      {t("chat.thinkingRequestHint")}
+                    </div>
                   </div>
                 )}
               </div>

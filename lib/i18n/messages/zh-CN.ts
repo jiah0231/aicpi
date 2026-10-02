@@ -479,6 +479,7 @@ export const zhCNLocale: LocalePlugin = {
     "chat.disableSound": "关闭完成提示音",
     "chat.enableSound": "开启完成提示音",
     "chat.thinkingUseDefault": "使用 pi 默认设置",
+    "chat.thinkingRequestHint": "这里显示请求的推理级别；off 不代表提供商或转发服务已实际关闭推理。",
     "chat.thinkingOff": "关闭推理",
     "chat.thinkingMinimal": "最低限度推理",
     "chat.thinkingLow": "低强度推理",

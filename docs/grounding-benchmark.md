@@ -28,10 +28,17 @@ approve or reject a candidate on the human's behalf.
 
 Benchmark prompts also opt into the grounding extension's request-control
 diagnostic. Each case's `result.json` records only allow-listed model identity
-and thinking controls observed immediately before provider transport. It does
+and thinking controls, model output/context limits, and serialized output and
+thinking budgets observed at the provider-request hook. Later extensions or an
+upstream proxy can still change the request. It does
 not record request messages, URLs, headers or credentials. Compare these
 `requestControls` with returned `thinkingBlocks`; a UI thinking level alone does
-not prove that a provider honored the serialized control.
+not prove that a provider honored the serialized control. `off` is a requested
+level, not verified upstream behavior. Missing fields mean that no recognized
+control was observed, not that reasoning is disabled or generation is unlimited.
+The diagnostics remain opt-in per marked turn; they never change model settings
+or generation budgets. Token counts must be integers in 0–1,000,000,000 (output
+and context limits must be positive); this is a validation bound, not a runtime cap.
 
 `focused` is an experimental extra-prompt variant, not a recommended default.
 Compare the same model, cases, deadline and runtime revision. Sequential runs
@@ -66,7 +73,8 @@ inventing a definite target to pass the test.
 from observed tool events. `nonToolElapsedMs` includes model work, networking
 and scheduling—it is not pure inference latency. Token totals include only
 completed responses observed before stopping; a timed-out request may have
-unreported usage. A zero provider-reported cost is not proof of a free request.
+unreported usage. OpenAI-compatible `completion_tokens` includes reasoning tokens;
+output usage is therefore not necessarily visible answer length. A zero provider-reported cost is not proof of a free request.
 
 The initial `benchmark-baseline-20261002-001` artifact predates the no-ground-truth
 clarification. Its reference/IoU fields are withdrawn and must not be used;

@@ -479,6 +479,7 @@ export const enLocale: LocalePlugin = {
     "chat.disableSound": "Disable completion sound",
     "chat.enableSound": "Enable completion sound",
     "chat.thinkingUseDefault": "Use pi default",
+    "chat.thinkingRequestHint": "This is the requested reasoning level. Off does not confirm that the provider or proxy disabled reasoning.",
     "chat.thinkingOff": "Reasoning off",
     "chat.thinkingMinimal": "Minimal reasoning",
     "chat.thinkingLow": "Low reasoning",
