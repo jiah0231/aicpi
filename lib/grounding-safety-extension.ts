@@ -553,18 +553,33 @@ function groundingEntryText(entry: unknown): string {
     .join("\n");
 }
 
-export function requestedBatchCount(prompt: string): number | undefined {
-  const matches = [
-    /(?:做|处理|完成|继续|接下来(?:的)?|前)\s*(?:满|下面这组|这组|以下(?:这组)?|下面(?:的)?|这|前)?\s*(\d+)\s*条/i,
-    /\b(\d+)\s*(?:records?|queries|items)\b/i,
+/** Extract job totals, never serial loading limits. Conflicting totals need clarification. */
+function requestedBatchCounts(prompt: string): number[] {
+  // Remove per-call instructions before looking for totals. In particular,
+  // “每次只加载并处理 1 条” is not a request to end the job after one approval.
+  const totals = prompt
+    .replace(/(?:每次|每一?批|每轮|一次(?!性))[^，,。；;\n!?]*/gu, " ")
+    .replace(/\b\d+\s*(?:records?|queries|items)\s*(?:(?:at|per)\s+a?\s*time|per\s+(?:call|batch|load))\b/giu, " ")
+    .replace(/\b(?:each|every)\s+(?:call|batch|load)\b[^,.;\n!?]*?\d+\s*(?:records?|queries|items)\b/giu, " ");
+  const counts = new Set<number>();
+  const patterns = [
+    /(?:做|处理|完成|继续|接下来(?:的)?|前|(?:随机)?(?:抽取|选取|选择))\s*(?:满|下面这组|这组|以下(?:这组)?|下面(?:的)?|这|前)?\s*(\d+)\s*(?:条|道)/g,
+    /\b(\d+)\s*(?:records?|queries|items)\b/gi,
   ];
-  for (const pattern of matches) {
-    const match = pattern.exec(prompt);
-    if (!match) continue;
+  const matches = [
+    ...prompt.matchAll(/\btargetCount\s*[:=]\s*(\d+)\b(?!\.)/gi),
+    ...patterns.flatMap((pattern) => [...totals.matchAll(pattern)]),
+  ];
+  for (const match of matches) {
     const count = Number(match[1]);
-    if (Number.isSafeInteger(count) && count > 0) return count;
+    if (Number.isSafeInteger(count) && count > 0) counts.add(count);
   }
-  return undefined;
+  return [...counts];
+}
+
+export function requestedBatchCount(prompt: string): number | undefined {
+  const counts = requestedBatchCounts(prompt);
+  return counts.length === 1 ? counts[0] : undefined;
 }
 
 /** Recovery is opt-in for this user turn, never inherited from a persisted job. */
@@ -586,7 +601,7 @@ function groundingTurnRequestsWork(prompt: string): boolean {
   if (clauses.some((clause) => /^\s*(?:(?:please\s+)?(?:stop|pause|cancel|halt)(?:\s+(?:now|here|please|it))?|(?:请|先)?(?:停|停止|暂停|取消)(?:一下|吧|了)?)\s*$/iu.test(clause))) return false;
   return clauses.some((clause) => {
     if (/(?:分析|解释|说明|复盘|总结|讨论|状态|进度|原因|为什么|怎么|如何|grounding_status)|\b(?:explain\w*|analy[sz]\w*|describ\w*|discuss\w*|summari[sz]\w*|summary|status|progress|inspect|audit|review|report|list|check|why|how|what|when)\b/iu.test(clause)) return false;
-    return requestedBatchCount(clause) !== undefined
+    return requestedBatchCounts(clause).length > 0
       || /\b(?:annotate|label|ground)\b|(?:批处理|标注|框出|画框|圈出|框选|图像定位|重新定位|纠偏|返修|重新核对)/iu.test(clause)
       || /\b(?:locate|draw|correct|revise|reopen|fix|submit|process|continue|resume|proceed|next)\b.{0,48}\b(?:box|bbox|records?|items?|query|queries|image|dataset|batch|target|annotat\w*|grounding|candidate)\b|(?:修正|改正|纠正|处理|核对|定位|继续|接着|恢复).{0,20}(?:框|目标|对象|图像|图片|数据|记录|样本|标注|批次)/iu.test(clause)
       || /^\s*(?:(?:please\s+)?(?:continue|resume|proceed|next|carry\s+on|go\s+on)(?:\s+(?:please|now|it))?|(?:请)?(?:继续|接着|下一条|接下来)(?:吧)?)\s*$/iu.test(clause)
@@ -1752,6 +1767,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       let batchToolStarted = false;
       let batchExhausted = false;
       let requestedRecordLimit: number | undefined;
+      let requestedCountAmbiguous = false;
       let sessionSavedCount = 0;
       let startupNudges = 0;
       let continuationNudges = 0;
@@ -2061,6 +2077,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       };
 
       const loadNextRecord = async (queryPath: string, outputDir: string) => {
+        if (requestedCountAmbiguous) throw new Error("The user request contains conflicting job totals. Ask the user to clarify the total record count before loading; do not substitute the per-call limit.");
         // Mark the batch as started before looking for a record. An empty
         // exhausted result is still a completed tool call; treating it as
         // "not started" would let agent_before_settle inject another request.
@@ -2468,6 +2485,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           // Tool use is authoritative: users should not need to write a
           // special "batch" keyword merely to unlock record views and the
           // serial save/continue safeguards.
+          if (requestedCountAmbiguous) throw new Error("The user request contains conflicting job totals. Ask the user to clarify the total record count before loading; do not substitute the per-call limit.");
           if (params.targetCount !== undefined) {
             if (!Number.isSafeInteger(params.targetCount) || params.targetCount < 1) throw new Error("targetCount must be a positive integer.");
             if (requestedRecordLimit !== undefined && requestedRecordLimit !== params.targetCount) {
@@ -3746,7 +3764,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         settleRecoveryAllowed = groundingTurnRequestsWork(prompt);
         reviewInterrupted = false;
         if (isGroundingPrompt(prompt)) active = true;
-        const requestedCount = settleRecoveryAllowed ? requestedBatchCount(prompt) : undefined;
+        const requestedCounts = settleRecoveryAllowed ? requestedBatchCounts(prompt) : [];
+        if (requestedCounts.length > 0) requestedCountAmbiguous = requestedCounts.length > 1;
+        const requestedCount = requestedCounts.length === 1 ? requestedCounts[0] : undefined;
         const currentRecord = loadedBatchRecords.values().next().value as LoadedBatchRecord | undefined;
         const hasPendingRecord = currentRecord !== undefined || persistedPending !== undefined;
         const adjustsRemainingCount = requestedCount !== undefined && hasPendingRecord
