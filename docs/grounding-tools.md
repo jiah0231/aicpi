@@ -4,8 +4,6 @@ Every prediction still requires explicit browser approval before it is saved.
 Rejection keeps the same record. Cropping and color analysis remain optional,
 with no per-record crop quota. No detector, OCR model or extra vision model is used.
 
-For an explicit per-generation output budget, see [Grounding generation control](grounding-generation-control.md). Full model/reasoning behavior remains the default.
-
 ## Preserve the requested target
 
 The original query and the user's task requirements remain the target throughout

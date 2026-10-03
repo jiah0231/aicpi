@@ -11,15 +11,11 @@ const REASONING_EFFORTS = new Set(["none", "off", "minimal", "low", "medium", "h
 
 export interface GroundingRequestControls {
   version: 1;
-  model: { provider?: string; id?: string; reasoning?: boolean; thinkingFormat?: string; maxTokens?: number; contextWindow?: number };
+  model: { provider?: string; id?: string; reasoning?: boolean; thinkingFormat?: string };
   controls: {
-    thinking?: { type: string; budget_tokens?: number } | string;
+    thinking?: { type: string } | string;
     reasoning_effort?: string;
     enable_thinking?: boolean;
-    max_tokens?: number;
-    max_completion_tokens?: number;
-    max_output_tokens?: number;
-    thinking_token_budget?: number;
   };
 }
 
@@ -42,13 +38,6 @@ function ownValue(value: unknown, key: string): unknown {
   } catch {
     return undefined;
   }
-}
-
-// Observability bound only, never a generation cap. Ignore invalid/implausible
-// values rather than coercing strings or serializing provider-specific objects.
-function tokenCount(value: unknown, allowZero = false): number | undefined {
-  return typeof value === "number" && Number.isSafeInteger(value)
-    && value >= (allowZero ? 0 : 1) && value <= 1_000_000_000 ? value : undefined;
 }
 
 function safeIdentity(value: unknown, allowSlash: boolean): string | undefined {
@@ -80,21 +69,10 @@ export function groundingRequestControls(model: unknown, payload: unknown): Grou
     result.model.thinkingFormat = thinkingFormat;
   }
 
-  for (const key of ["maxTokens", "contextWindow"] as const) {
-    const value = tokenCount(ownValue(model, key));
-    if (value !== undefined) result.model[key] = value;
-  }
-  for (const key of ["max_tokens", "max_completion_tokens", "max_output_tokens", "thinking_token_budget"] as const) {
-    const value = tokenCount(ownValue(payload, key), key === "thinking_token_budget");
-    if (value !== undefined) result.controls[key] = value;
-  }
-
   const thinking = ownValue(payload, "thinking");
   const thinkingType = ownValue(thinking, "type");
   if (typeof thinkingType === "string" && THINKING_TYPES.has(thinkingType)) {
     result.controls.thinking = { type: thinkingType };
-    const budget = tokenCount(ownValue(thinking, "budget_tokens"), true);
-    if (budget !== undefined) result.controls.thinking.budget_tokens = budget;
   } else if (typeof thinking === "string" && THINKING_TYPES.has(thinking)) {
     result.controls.thinking = thinking;
   }

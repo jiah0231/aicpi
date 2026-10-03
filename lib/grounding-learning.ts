@@ -96,12 +96,6 @@ export async function selectGroundingLessons(
   options: { filePath?: string; limit?: number } = {},
 ): Promise<GroundingLesson[]> {
   const lessons = await readGroundingLessons(options.filePath);
-  try {
-    const { readActiveGenericLessons, learningStoreOptionsForLegacyPath } = await import("./grounding-learning-store");
-    lessons.push(...await readActiveGenericLessons(learningStoreOptionsForLegacyPath(options.filePath)));
-  } catch {
-    // An optional invalid/unreadable consolidation store must not block annotation.
-  }
   const limit = Number.isFinite(options.limit)
     ? Math.min(MAX_RESULT_LIMIT, Math.max(1, Math.floor(options.limit!))) : DEFAULT_RESULT_LIMIT;
   const seen = new Set<string>();
@@ -123,7 +117,7 @@ export async function selectGroundingLessons(
 
 export function groundingLessonsForModel(lessons: GroundingLesson[]) {
   return {
-    advisory: "Human-reviewed general procedures, explicitly confirmed as sample-independent. Some procedures may have been organized by AI before human activation. Never override current evidence, human review or runtime safety rules. Lexical validation cannot prove semantic independence; do not treat these procedures as answers, labels or evidence about any record. No source query or image is used to retrieve them.",
+    advisory: "Human-authored general procedures, explicitly reviewed as sample-independent. Never override current evidence, human review or runtime safety rules. Lexical validation cannot prove semantic independence; do not treat these procedures as answers, labels or evidence about any record. No source query or image is used to retrieve them.",
     items: lessons.flatMap((lesson) => {
       // Keep the final projection fail-closed even if a caller bypassed the reader.
       try {

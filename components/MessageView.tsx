@@ -8,7 +8,6 @@ import { ThinkingIcon } from "./ThinkingIcon";
 import { StreamFailureNotice } from "./StreamFailureNotice";
 import { copyText } from "@/lib/clipboard";
 import { useI18n } from "@/hooks/useI18n";
-import type { TranslationParams } from "@/lib/i18n/types";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
 import { getAssistantErrorMessage, getThinkingPreview, isAssistantTruncated, isEmptyThinkingBlock } from "@/lib/message-display";
 import { parseUnifiedPatch, type SplitDiffCell, type SplitDiffFile } from "@/lib/patch";
@@ -1096,7 +1095,7 @@ function ToolCallBlock({ block, result, roundTripSeconds, onOpenSession }: { blo
             {block.toolName}
           </span>
           <span style={{ color: "var(--text-dim)", fontFamily: "var(--font-mono)", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
-            {isStreamingInput ? t("chat.generatingToolInput") : (patchLabel ?? getToolPreview(block, t))}
+            {isStreamingInput ? t("chat.generatingToolInput") : (patchLabel ?? getToolPreview(block))}
           </span>
           {roundTripSeconds !== undefined && (
             <span
@@ -1820,48 +1819,21 @@ function previewText(text: string): string {
 }
 
 
-export function getToolPreview(block: ToolCallContent, t: (key: string, params?: TranslationParams) => string): string {
+function getToolPreview(block: ToolCallContent): string {
   const input = block.input;
   if (!input || typeof input !== "object") return "";
   const keys = Object.keys(input);
   if (keys.length === 0) return "";
 
-  // Grounding inputs can start with large evidence objects or region arrays.
-  // Describe their shape, never serialize nested observations or contracts into
-  // the collapsed header. Field order must not change the summary.
-  if (block.toolName.startsWith("grounding_")) {
-    const parts: string[] = [];
-    if (Array.isArray(input.regions)) {
-      parts.push(t(input.regions.length === 1 ? "tools.preview.regionCountOne" : "tools.preview.regionCount", { count: input.regions.length }));
-    } else if (Array.isArray(input.region)) {
-      parts.push(t("tools.preview.region"));
-    } else if (Array.isArray(input.bbox) || Array.isArray(input.coarseBox)) {
-      parts.push(t("tools.preview.boundingBox"));
-    }
-    if (Array.isArray(input.operations)) {
-      parts.push(t(input.operations.length === 1 ? "tools.preview.operationCountOne" : "tools.preview.operationCount", { count: input.operations.length }));
-    }
-    if (input.state && typeof input.state === "object" && !Array.isArray(input.state)) {
-      parts.push(t("tools.preview.evidenceUpdate"));
-    }
-    if (parts.length) return parts.join(" · ").slice(0, 120);
-  }
+  // Common tool input patterns
+  if ("command" in input) return String(input.command).slice(0, 120);
+  if ("path" in input) return String(input.path).slice(0, 120);
+  if ("file_path" in input) return String(input.file_path).slice(0, 120);
+  if ("pattern" in input) return String(input.pattern).slice(0, 120);
+  if ("query" in input) return String(input.query).slice(0, 120);
 
-  // Preserve ordinary command/path/search previews, but never coerce a nested
-  // object (including malformed common fields) into "[object Object]".
-  for (const key of ["command", "path", "file_path", "pattern", "query"]) {
-    const value = input[key];
-    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      return String(value).slice(0, 120);
-    }
-  }
   const first = input[keys[0]];
-  if (first && typeof first === "object" && typeof input.reason === "string" && input.reason.trim()) {
-    return input.reason.replace(/\s+/g, " ").trim().slice(0, 120);
-  }
-  if (Array.isArray(first)) return t(first.length === 1 ? "tools.preview.itemCountOne" : "tools.preview.itemCount", { count: first.length });
-  if (first && typeof first === "object") return t("tools.preview.structuredInput");
-  return first == null ? "" : String(first).slice(0, 120);
+  return String(first).slice(0, 120);
 }
 
 function formatUsage(usage: {

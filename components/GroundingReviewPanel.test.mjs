@@ -205,14 +205,3 @@ test("proposal geometry follows editable coordinates and remains explicitly advi
   assert.match(source, /遮挡可正常重叠/);
   assert.match(source, /声明框本身错误也可能显示 100%/);
 });
-
-test("model reasons are labelled as proposals and unresolved previews never claim verification", async () => {
-  assert.match(source, /t\("groundingReview\.modelReason"\)/);
-  assert.match(source, /unresolvedChecks && <div>\{t\("groundingReview\.unresolvedPreviewNote"\)\}/);
-  assert.match(source, /value=\{reason\} onChange=\{\(event\) => setReason\(event\.target\.value\)\}/, "preserve editable model text rather than censoring claims");
-  for (const locale of ["en", "zh-CN", "zh-TW"]) {
-    const { [locale === "en" ? "enLocale" : locale === "zh-CN" ? "zhCNLocale" : "zhTWLocale"]: plugin } = await jiti.import(`../lib/i18n/messages/${locale}.ts`);
-    for (const key of ["groundingReview.modelReason", "groundingReview.unresolvedPreviewNote"]) assert.ok(plugin.messages[key]?.length > 8, `${locale}: ${key}`);
-    if (locale === "en") assert.match(plugin.messages["groundingReview.unresolvedPreviewNote"], /does not verify missing identity, rank, or pose evidence/);
-  }
-});

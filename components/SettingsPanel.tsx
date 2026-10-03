@@ -24,7 +24,6 @@ import {
   isThinkingExpandedByDefault,
   setThinkingExpandedByDefault,
 } from "@/lib/thinking-expansion-preference";
-import { GroundingLearningPanel } from "./GroundingLearningPanel";
 import { ModelsConfig } from "./ModelsConfig";
 import { setupPushSubscription } from "@/lib/push-client";
 import { SkillsConfig } from "./SkillsConfig";
@@ -161,7 +160,6 @@ function GeneralSettings({ sessionId, onSessionReloaded, quoteSelectionEnabled, 
   return (
     <div className="settings-general">
       <h2 className="settings-general-title">{t("settings.general")}</h2>
-      <GroundingLearningPanel />
 
       <section className="settings-general-section">
         <h3 className="settings-general-heading">{t("settings.appearance")}</h3>

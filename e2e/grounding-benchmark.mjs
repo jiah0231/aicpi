@@ -28,20 +28,11 @@ function diagnosticFromEvent(event) {
   if (typeof data.model?.id === "string") model.id = data.model.id;
   if (typeof data.model?.reasoning === "boolean") model.reasoning = data.model.reasoning;
   if (typeof data.model?.thinkingFormat === "string") model.thinkingFormat = data.model.thinkingFormat;
-  const tokenCount = (value, allowZero = false) => typeof value === "number" && Number.isSafeInteger(value)
-    && value >= (allowZero ? 0 : 1) && value <= 1_000_000_000;
-  for (const key of ["maxTokens", "contextWindow"]) {
-    if (tokenCount(data.model?.[key])) model[key] = data.model[key];
-  }
   const controls = {};
-  for (const key of ["max_tokens", "max_completion_tokens", "max_output_tokens", "thinking_token_budget"]) {
-    if (tokenCount(data.controls?.[key], key === "thinking_token_budget")) controls[key] = data.controls[key];
-  }
   const thinking = data.controls?.thinking;
   if (typeof thinking === "string") controls.thinking = thinking;
   else if (thinking && typeof thinking === "object" && !Array.isArray(thinking) && typeof thinking.type === "string") {
     controls.thinking = { type: thinking.type };
-    if (tokenCount(thinking.budget_tokens, true)) controls.thinking.budget_tokens = thinking.budget_tokens;
   }
   if (typeof data.controls?.reasoning_effort === "string") controls.reasoning_effort = data.controls.reasoning_effort;
   if (typeof data.controls?.enable_thinking === "boolean") controls.enable_thinking = data.controls.enable_thinking;
