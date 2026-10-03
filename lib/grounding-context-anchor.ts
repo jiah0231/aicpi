@@ -53,6 +53,7 @@ export function withGroundingContextAnchor(messages: AgentMessage[], record?: An
           ordinal: interpretation.spatialOrder.ordinal, candidateIds: interpretation.spatialOrder.candidateIds,
           selectedCandidateId: interpretation.spatialOrder.selectedCandidateId, candidateSetStatus: interpretation.spatialOrder.candidateSet.status } : undefined })) ?? [],
       openQuestions: state?.openQuestions ?? [],
+      lastTrial: state?.lastTrial,
     },
   } : { runtimeState: "record_not_loaded", ...unloaded };
   const reminder = record

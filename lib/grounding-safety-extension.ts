@@ -192,6 +192,13 @@ const groundingContractSchema = Type.Object({
 
 const groundingWorkingStateSchema = Type.Object({ target: Type.Optional(Type.String({ maxLength: 600 })),
   contract: Type.Optional(groundingContractSchema),
+  lastTrial: Type.Optional(Type.Object({
+    question: Type.String({ minLength: 1, maxLength: 400 }),
+    outcome: Type.Union([Type.Literal("useful"), Type.Literal("inconclusive"), Type.Literal("contradictory"), Type.Literal("failed")]),
+    observation: Type.String({ minLength: 1, maxLength: 400 }),
+    remainingUnknown: Type.String({ maxLength: 400 }),
+    nextObservation: Type.Union([Type.String({ minLength: 1, maxLength: 400 }), Type.Null()]),
+  }, { description: "Optional assessment of a previous trial, not this call's future result. No useful next observation: null. No extra notes call required." })),
   facts: Type.Optional(Type.Array(Type.String({ maxLength: 400 }), { maxItems: 8 })),
   hypotheses: Type.Optional(Type.Array(Type.String({ maxLength: 400 }), { maxItems: 8 })),
   openQuestions: Type.Optional(Type.Array(Type.String({ maxLength: 400 }), { maxItems: 8 })),
@@ -2518,6 +2525,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       const inlineStateReceipt = (loaded: LoadedBatchRecord, input: unknown) => input === undefined ? {} : {
         inlineStateUpdate: { saved: true, fields: Object.keys(input as object),
           selection: loaded.workingState?.selection,
+          ...(loaded.workingState?.lastTrial ? { declaredOutcome: loaded.workingState.lastTrial } : {}),
           constraintAssessment: assessOriginalQueryConstraints(loaded.workingState?.contract, loaded.record.query ?? "", loaded.workingState?.selection?.bbox, loaded.views) },
       };
       const ensureInspectionCurrent = (key: string, loaded: LoadedBatchRecord, state: GroundingWorkingState | undefined, bbox: LoadedBatchRecord["currentBbox"]) => {
@@ -2554,7 +2562,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         const convergence = groundingDecisionCheckpoint(loaded.workingState, assessment, loaded.decisionProgress);
         const validConditions = new Set([...convergence.unresolvedConditions.map((item) => item.condition), ...assessment.issues.map((item) => item.code),
           ...(!loaded.workingState?.contract ? ["query"] : []), ...(assessment.canLock ? ["boundary"] : [])]);
-        const testKey = JSON.stringify([test?.condition, intent, groundingConditionSignature(loaded.workingState)]);
+        const testKey = JSON.stringify([test?.condition, intent, test?.observable.trim().toLowerCase().replace(/\s+/g, " "), groundingConditionSignature(loaded.workingState)]);
         const concreteTest = test && validConditions.has(test.condition) && test.observable.trim().length >= 8;
         if (intent === "recover_evidence" && !retained) return { signature, reusedInformation: true };
         if (concreteTest && (intent === "boundary_or_part" || intent === "counterevidence") && !loaded.inspectionTests?.has(testKey)) {
@@ -2564,7 +2572,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         }
         return { signature, checkpoint: { repeatedInspection: true, requestedQuestion: reason.trim(), priorViewIds,
           retainedPixels: retained, informationNovelty: "reused_source_pixels", unresolvedConditions: convergence.unresolvedConditions,
-          decisionCheckpoint: "No new image generated: this region repeats adequately resolved source pixels. Reuse retained evidence. For a specific unresolved boundary or counterevidence test, supply inspectionIntent and inspectionTest {condition: unresolved requirement ID or issue code, observable: concrete visible distinction}; use condition query before a contract exists or boundary for a supported target’s final edge check. Rewording, bbox shifts, zoom and archive do not resolve a condition. If pixels are unavailable, use recover_evidence; recovery is not new information. Otherwise submit an unresolved low-confidence proposal for human review, or ask clarification and pause. Invisible evidence remains unresolved.",
+          decisionCheckpoint: "No new image generated: this region repeats adequately resolved source pixels. Reuse retained evidence. For a distinct unresolved boundary or counterevidence test, supply inspectionIntent and inspectionTest {condition: unresolved requirement ID or issue code, observable: concrete visible distinction}; use condition query before a contract exists or boundary for a supported target’s final edge check. Distinct observable hypotheses remain allowed; the runtime cannot judge semantic novelty. Rewording, bbox shifts, zoom and archive alone do not resolve a condition. If pixels are unavailable, use recover_evidence; recovery is not new information. Otherwise submit an unresolved low-confidence proposal for human review, or ask clarification and pause. Invisible evidence remains unresolved.",
         } };
       };
 
@@ -2750,11 +2758,13 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         label: "Grounding image processing",
         description: "Optional local boundary aid: compare an original visible ROI with 1–3 independent edge/filter/sharpen/contrast/binary views in one labeled image. No detector, extra model, identity evidence, bbox inference or saving. Skip when clean pixels already answer the question. Each panel has an exact source-mapped viewId.",
         promptGuidelines: [
+          "Optional aid for a difficulty you judge worth testing, not a required step. Assess whether its result answers that question, contradicts a hypothesis, is inconclusive or failed. Piggyback the previous result in state.lastTrial when useful; no extra notes call is required. Tool success and new pixels do not imply progress. Continue for a distinct plausible observation or recovery; if none remains, review the unresolved proposal or ask clarification.",
           "Choose only operations that answer a concrete remaining boundary question after identifying the object/part. Every operation starts from the same original visible ROI, never another derived preview. Edges are Sobel grayscale magnitude, not object contours; threshold is fixed grayscale binarization. Blur/median can erase narrow parts; sharpening/contrast can invent apparent outlines. Check against the original and retain uncertainty.",
           "Pass source-normalized region, or a current visible viewId with view_pixels/view_normalized. Each output view uses whole-composite coordinates inside its displayRect. Processing preserves geometry, not identity evidence. Recall via grounding_view renders the original source region, not the processing operation. Same-source rerenders add no independent support; do not sweep parameters to force a desired boundary.",
           "At most 3 operations, ROI 4 million pixels, source 100 million pixels/64 MB. sigma .3–3 (default 1), median size 3/5/7 (default 3), contrast gain .5–3 around gray 128 (default 1.5), threshold integer level 0–255 (default 128). Source border handling is ROI-local and transparency is composited on white. No image uploads or files are written.",
         ],
         parameters: Type.Object({
+          state: Type.Optional(groundingInlineStateSchema),
           key: Type.Optional(Type.String()), queryPath: Type.Optional(Type.String()),
           region: Type.Array(Type.Number(), { minItems: 4, maxItems: 4 }),
           coordinateSpace: Type.Optional(Type.Union([Type.Literal("source"), Type.Literal("view_pixels"), Type.Literal("view_normalized")])),
@@ -2766,12 +2776,15 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             gain: Type.Optional(Type.Number({ minimum: .5, maximum: 3, description: "contrast only" })),
             level: Type.Optional(Type.Integer({ minimum: 0, maximum: 255, description: "threshold only" })),
           }), { minItems: 1, maxItems: 3 }),
-          reason: Type.String({ minLength: 8, maxLength: 400, description: "Concrete boundary question answered by these operations" }),
+          reason: Type.String({ minLength: 8, maxLength: 400, description: "Boundary question these operations may help resolve" }),
         }),
         executionMode: "sequential",
         async execute(_id, params, signal) {
           signal?.throwIfAborted();
-          const [key, loaded] = resolveLoadedRecord(params);
+          const [key, originalLoaded] = resolveLoadedRecord(params);
+          const initialWorkingState = originalLoaded.workingState;
+          const initialBbox = originalLoaded.currentBbox;
+          const loaded = applyInlineState(originalLoaded, params.state);
           if (savingRecord) throw new Error("Wait for the current human review before processing more images.");
           if (typeof params.reason !== "string" || params.reason.trim().length < 8 || params.reason.length > 400) throw new Error("Explain the boundary question in 8–400 characters.");
           const operations = validateGroundingImageOperations(params.operations as GroundingImageOperation[]);
@@ -2800,6 +2813,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             loaded.processedPreview = { signature, source: source.bytes, result, encoded };
           }
           signal?.throwIfAborted();
+          ensureInspectionCurrent(key, originalLoaded, initialWorkingState, initialBbox);
+          commitInspectionState(originalLoaded, loaded);
+          originalLoaded.processedPreview = loaded.processedPreview;
           const panels = result.panels.map((panel) => {
             const input: Omit<GroundingViewDescriptor, "id"> = {
               modality: "visible", region: result.region, sourceWidth: result.sourceWidth, sourceHeight: result.sourceHeight,
@@ -2812,7 +2828,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             const view = loaded.views.register(input);
             return { ...view, ...(panel.operation ? { operation: panel.operation } : {}), ...(sourceReuse ? { sourceReuse } : {}) };
           });
-          const details = { key, ...groundingTargetReminder(loaded), modality: "visible", source: source.label,
+          const details = { key, ...groundingTargetReminder(loaded), ...inlineStateReceipt(loaded, params.state), modality: "visible", source: source.label,
             role: "measurement_only", establishesObjectIdentity: false, saved: false,
             region: result.region, regionPixels: result.regionPixels, operations, reason: params.reason,
             panels, evidenceViewIds: panels.map((panel) => panel.id), evidenceImageBlocks: [{ imageIndex: 0, viewIds: panels.map((panel) => panel.id) }], warnings: result.warnings, renderReused,
@@ -2827,11 +2843,13 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         label: "Grounding edge candidate boxes",
         description: "Optional local Canny-like edge measurement around a visually identified target's coarse box. Returns up to three connected-edge candidate bounds with clean original, edge and candidate-overlay panels. Not object detection, filled segmentation, identity confidence or automatic annotation. No models, remote image upload or file writes.",
         promptGuidelines: [
+          "Optional aid for a difficulty you judge worth testing, not a required step. Assess whether its result answers that question, contradicts a hypothesis, is inconclusive or failed. Piggyback the previous result in state.lastTrial when useful; no extra notes call is required. Tool success and new pixels do not imply progress. Continue for a distinct plausible observation or recovery; if none remains, review the unresolved proposal or ask clarification.",
           "Use only for a concrete remaining boundary question. Inputs are full visible-source normalized coordinates, never display or sensor coordinates. region must contain coarseBox with context. Optional point filters component bounding rectangles only; it does not establish foreground membership.",
           "At most 1 million ROI pixels, 100 million source pixels/64 MB, 4096 components and 3 returned candidates. No analysis downsampling. Fixed mild blur, gradient thinning and hysteresis; low/high thresholds default 20/50 in gradient-magnitude units. Do not sweep parameters to force a result.",
           "Compare candidate bounds with original pixels and preserve visible tails/protrusions. Disconnected parts are not merged; edge components need not be closed or complete objects. rankScore is coarse-box agreement with a border penalty, not confidence. No largest-component default, automatic target choice or approval. Use ordinary save review after choosing a visually supported proposal.",
         ],
         parameters: Type.Object({
+          state: Type.Optional(groundingInlineStateSchema),
           key: Type.Optional(Type.String()), queryPath: Type.Optional(Type.String()),
           region: Type.Array(Type.Number(), { minItems: 4, maxItems: 4, description: "Full visible-source normalized search ROI containing coarseBox" }),
           coarseBox: Type.Array(Type.Number(), { minItems: 4, maxItems: 4, description: "Full visible-source normalized rough target bounds" }),
@@ -2843,7 +2861,10 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         executionMode: "sequential",
         async execute(_id, params, signal) {
           signal?.throwIfAborted();
-          const [key, loaded] = resolveLoadedRecord(params);
+          const [key, originalLoaded] = resolveLoadedRecord(params);
+          const initialWorkingState = originalLoaded.workingState;
+          const initialBbox = originalLoaded.currentBbox;
+          const loaded = applyInlineState(originalLoaded, params.state);
           if (savingRecord) throw new Error("Wait for the current human review before refining a box.");
           if (typeof params.reason !== "string" || params.reason.trim().length < 8 || params.reason.length > 400) throw new Error("Explain the boundary question in 8–400 characters.");
           if ("viewId" in params || "coordinateSpace" in params) throw new Error("grounding_refine_box accepts full visible-source coordinates only; map view coordinates first.");
@@ -2857,8 +2878,10 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const { image, ...result } = await proposeGroundingContours(source.bytes, contourOptions, signal);
           const encoded = await encodeGroundingPreview(image, "image/png");
           signal?.throwIfAborted();
-          if (resolveLoadedRecord(params)[1] !== loaded || savingRecord) throw new Error("Record or human-review state changed during refinement; inspect the current record again.");
+          if (resolveLoadedRecord(params)[1] !== originalLoaded || savingRecord) throw new Error("Record or human-review state changed during refinement; inspect the current record again.");
           checkLocked();
+          ensureInspectionCurrent(key, originalLoaded, initialWorkingState, initialBbox);
+          commitInspectionState(originalLoaded, loaded);
           const panels = result.panels.map((panel) => {
             const input: Omit<GroundingViewDescriptor, "id"> = {
               modality: "visible", region: result.region, sourceWidth: result.sourceWidth, sourceHeight: result.sourceHeight,
@@ -2870,7 +2893,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             const sourceReuse = loaded.views.sourceReuse(input);
             return { ...loaded.views.register(input), ...(sourceReuse ? { sourceReuse } : {}) };
           });
-          const details = { key, ...groundingTargetReminder(loaded), modality: "visible", source: source.label,
+          const details = { key, ...groundingTargetReminder(loaded), ...inlineStateReceipt(loaded, params.state), modality: "visible", source: source.label,
             role: "measurement_only", establishesObjectIdentity: false, requiresHumanReview: true, saved: false,
             region: result.region, regionPixels: result.regionPixels, options: result.options,
             sourceWidth: result.sourceWidth, sourceHeight: result.sourceHeight,
@@ -2887,6 +2910,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         label: "Grounding local color analysis",
         description: "Optional deterministic pixel measurement for a visually identified target or part whose color reliably contrasts with its surroundings and whose boundary needs measurement. Not a default step for every record: skip it when color is unhelpful or the box is already clear. Analyzes only original visible-image pixels in a chosen local region; returns source-normalized color-component bounds, an optional point sample, clean crop and mask preview. It cannot identify the target, recover hidden boundaries, or save a result.",
         promptGuidelines: [
+          "Optional aid for a difficulty you judge worth testing, not a required step. Assess whether its result answers that question, contradicts a hypothesis, is inconclusive or failed. Piggyback the previous result in state.lastTrial when useful; no extra notes call is required. Tool success and new pixels do not imply progress. Continue for a distinct plausible observation or recovery; if none remains, review the unresolved proposal or ask clarification.",
           "First inspect the image and establish the requested object/part from shape, structure and surrounding context. Use this optional tool only if reliable local color contrast can answer a remaining pixel-boundary question; neither a color word in the query nor a difficult record requires it. If the box is already clear, proceed to review without color analysis.",
           "Skip color analysis when identity is unresolved or color does not distinguish the target. Use existing visual evidence, grounding_view or grounding_compare as needed instead. Shadows, lighting, reflections, similar-colored neighbors, low resolution and occlusion can merge or fragment matches; preserve uncertainty rather than forcing a color-derived box.",
           "Sampling always uses the original visible image. Only visible viewIds are accepted; infrared/depth views cannot transfer coordinates without registration, even at equal dimensions. Choose a small ROI around the visually identified part with enough surrounding context to check the boundary.",
@@ -2897,6 +2921,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Returned bbox coordinates enclose only the selected matching pixels, not necessarily the full requested target or part. Check them against the clean image; do not treat missing or occluded pixels as recovered. Coordinates are already in full-image source space: pass coordinateSpace source when saving. Submit your chosen/corrected box for human approval; color analysis never auto-saves.",
         ],
         parameters: Type.Object({
+          state: Type.Optional(groundingInlineStateSchema),
           key: Type.Optional(Type.String({ description: "Optional when exactly one record is loaded" })),
           queryPath: Type.Optional(Type.String({ description: "Optional; defaults to the loaded record's dataset" })),
           region: Type.Array(Type.Number(), { minItems: 4, maxItems: 4, description: "Small ROI in coordinateSpace; source-normalized by default, or coordinates on viewId" }),
@@ -2911,11 +2936,11 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         executionMode: "sequential",
         async execute(_id, params, signal) {
           signal?.throwIfAborted();
-          if (!active) throw new Error("Grounding runtime safety is not active for this session.");
-          const current = params.key ? [params.key, loadedBatchRecords.get(params.key)] as const : loadedBatchRecords.entries().next().value;
-          if (!current?.[1]) throw new Error("Load a record with grounding_next_batch, or use grounding_status and grounding_reopen_record to revise an approved result.");
-          const [key, loaded] = current;
-          if (params.queryPath && normalizePath(resolve(options.cwd, params.queryPath)) !== normalizePath(loaded.sourcePath)) throw new Error("Use the currently loaded record's queryPath for color analysis.");
+          const [key, originalLoaded] = resolveLoadedRecord(params);
+          if (savingRecord) throw new Error("Wait for the current human review before color analysis.");
+          const initialWorkingState = originalLoaded.workingState;
+          const initialBbox = originalLoaded.currentBbox;
+          const loaded = applyInlineState(originalLoaded, params.state);
           const coordinateSpace = params.coordinateSpace ?? "source";
           const mappedView = coordinateSpace === "view_pixels" || coordinateSpace === "view_normalized";
           if (mappedView && !params.viewId) throw new Error("viewId is required for view_pixels or view_normalized color coordinates.");
@@ -2934,7 +2959,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             width: encodedRawPreview.width,
             height: encodedRawPreview.height,
           });
-          const details = { key, ...groundingTargetReminder(loaded), ...analysis,
+          ensureInspectionCurrent(key, originalLoaded, initialWorkingState, initialBbox);
+          commitInspectionState(originalLoaded, loaded);
+          const details = { key, ...groundingTargetReminder(loaded), ...inlineStateReceipt(loaded, params.state), ...analysis,
             previewWidth: encodedRawPreview.width, previewHeight: encodedRawPreview.height,
             coordinateSpace: "source", inputCoordinateSpace: coordinateSpace,
             ...(params.viewId ? { inputViewId: params.viewId } : {}), saved: false,
@@ -2994,6 +3021,9 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             throw new Error("Clarification must be a nonempty question of at most 400 characters.");
           }
           if (params.clarification !== undefined && savingRecord) throw new Error("The current record is already awaiting human review; wait for that review rather than opening another question.");
+          if (savingRecord && (params.state !== undefined || [params.pin, params.unpin, params.archive, params.restore].some((ids) => ids?.length))) {
+            throw new Error("The current record is awaiting human review; wait before changing its evidence or trial assessment.");
+          }
           const patch = params.state === undefined ? undefined : validateGroundingWorkingState(params.state, loaded.record.query ?? "");
           let state = patch === undefined ? loaded.workingState : { ...loaded.workingState, ...patch };
           if (state?.contract) validateGroundingConstraintContract(state.contract, loaded.record.query ?? "");
@@ -3075,7 +3105,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         label: "Grounding candidate comparison",
         description: "Compare model-chosen regions in clean detail panels with an annotated full-image overview. Optional object bboxes enable source-center/size/order geometry distinct from inspection ROIs. No object detection: you choose every ROI and candidate box. Returns panel viewIds with exact composite-image coordinates; pass the chosen panel viewId and view_pixels/view_normalized when saving a measured box.",
         promptGuidelines: [
-          "Carry new observations and candidate/condition evidence in optional state inline (same partial-update schema as grounding_evidence). Preserve original query counting conditions. Reuse known evidence; do not spend another tool call merely writing notes. If no concrete visual question remains, propose a supported/unresolved box for review or ask clarification.",
+          "Use an optional inspection only for an actual difficulty with a plausible observable test. Carry observations in state inline; state.lastTrial can assess a previous useful, inconclusive, contradictory or failed result and what remains unknown. No extra notes call is required. Preserve original query counting conditions. A failed trial or tool switch alone is not stagnation. If no useful next observation remains, propose a supported/unresolved box for human review or ask clarification.",
           "Set regions[i].modality for each sensor (defaults to top-level modality, then visible). Generated labels name actual sensors. A single comparison can include visible/infrared/depth panels with independent source regions; never infer registration or cross-sensor rank. The overview shows the first panel sensor only.",
           "Use overview for relations between candidates and detail panels for local parts. Every panel label is outside its pixels; different panel scales must not be used to compare real object size. You may call again with more candidates; the 4-panel limit bounds one image only.",
           "The overview marks inspection ROIs with dashed cyan outlines and optional declared object bboxes with solid orange outlines. Supply bbox only when you can identify the object's extent; region is viewing context, not an object box. sourceGeometry sorts only supplied object centers, reports missing boxes/ties, and does not establish identity or complete scene membership.",
@@ -3190,7 +3220,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         description: "Inspect a full modality or crop, or recall an actual returned viewId. For a clean crop use region + reason; zoom is optional. region only changes the viewport; bbox is a separate optional hypothesis. Every view returns exact coordinate mapping for measurement.",
         promptSnippet: "View an additional modality or a model-selected zoom crop with the current bbox marked",
         promptGuidelines: [
-          "Carry new observations and candidate/condition evidence in optional state inline (same partial-update schema as grounding_evidence). Preserve original query counting conditions. Reuse known evidence; do not spend another tool call merely writing notes. If no concrete visual question remains, propose a supported/unresolved box for review or ask clarification.",
+          "Use an optional inspection only for an actual difficulty with a plausible observable test. Carry observations in state inline; state.lastTrial can assess a previous useful, inconclusive, contradictory or failed result and what remains unknown. No extra notes call is required. Preserve original query counting conditions. A failed trial or tool switch alone is not stagnation. If no useful next observation remains, propose a supported/unresolved box for human review or ask clarification.",
           "Visible is already attached by grounding_next_batch. Request infrared or depth only when the query or visible ambiguity requires it.",
           "Equal image dimensions do not prove cross-modal alignment. Establish object correspondence and spatial registration before transferring an infrared/depth box to the visible image used for review. A viewId maps display coordinates within its modality, not between sensors. Conflicting positions or structure remain unresolved evidence, not confirmation of identity.",
           "bbox is an optional hypothesis in the requested modality, not evidence. Only a visible bbox updates the review hypothesis; infrared/depth boxes stay local to that view. Omit bbox while choosing the target; clean pixels are the default without a hypothesis.",

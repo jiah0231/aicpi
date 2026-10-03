@@ -9,6 +9,14 @@ export type GroundingWorkingState = {
   openQuestions?: string[];
   ruledOut?: string[];
   contract?: GroundingConstraintContract;
+  /** Model assessment of a previous trial, never inferred from execution success. */
+  lastTrial?: {
+    question: string;
+    outcome: "useful" | "inconclusive" | "contradictory" | "failed";
+    observation: string;
+    remainingUnknown: string;
+    nextObservation: string | null;
+  };
   selection?: {
     status: "locked" | "reconsidering";
     bbox?: [number, number, number, number];
@@ -41,12 +49,28 @@ export function validateGroundingWorkingState(input: unknown, originalQuery?: st
     throw new Error("Grounding working state must be an object.");
   }
   const fields = input as Record<string, unknown>;
-  const allowed = new Set(["target", "facts", "hypotheses", "openQuestions", "ruledOut", "selection", "contract"]);
+  const allowed = new Set(["target", "facts", "hypotheses", "openQuestions", "ruledOut", "selection", "contract", "lastTrial"]);
   for (const key of Object.keys(fields)) {
     if (!allowed.has(key)) throw new Error(`Unknown grounding working state field: ${key}`);
   }
 
   const result: GroundingWorkingState = {};
+  if (Object.hasOwn(fields, "lastTrial")) {
+    const trial = fields.lastTrial;
+    if (!trial || typeof trial !== "object" || Array.isArray(trial)) throw new Error("Grounding working state lastTrial must be an object.");
+    const values = trial as Record<string, unknown>;
+    const keys = ["question", "outcome", "observation", "remainingUnknown", "nextObservation"];
+    if (Object.keys(values).some((key) => !keys.includes(key)) || keys.some((key) => !Object.hasOwn(values, key))) {
+      throw new Error("Grounding working state lastTrial requires question, outcome, observation, remainingUnknown and nextObservation only.");
+    }
+    if (!["useful", "inconclusive", "contradictory", "failed"].includes(values.outcome as string)) throw new Error("Grounding working state lastTrial has an invalid outcome.");
+    const question = validateText(values.question, "lastTrial.question", 400);
+    const observation = validateText(values.observation, "lastTrial.observation", 400);
+    const remainingUnknown = validateText(values.remainingUnknown, "lastTrial.remainingUnknown", 400);
+    const nextObservation = values.nextObservation === null ? null : validateText(values.nextObservation, "lastTrial.nextObservation", 400);
+    if (!question || !observation || nextObservation === "") throw new Error("Grounding working state lastTrial needs a question, observation and a nonempty nextObservation or null.");
+    result.lastTrial = { question, outcome: values.outcome as NonNullable<GroundingWorkingState["lastTrial"]>["outcome"], observation, remainingUnknown, nextObservation };
+  }
   if (Object.hasOwn(fields, "contract")) {
     result.contract = validateGroundingConstraintContract(fields.contract, originalQuery);
   }

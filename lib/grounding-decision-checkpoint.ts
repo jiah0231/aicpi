@@ -51,10 +51,11 @@ export function groundingDecisionCheckpoint(state: GroundingWorkingState | undef
     inspections: progress?.inspections ?? 0,
     inspectionsWithoutDeclaredChange: unchanged,
     repeatedSourceAction: progress?.lastActionRepeated ?? false,
-    decisionRequired: !assessment.canLock && Boolean(progress && (unchanged > 0 || progress.lastActionRepeated)),
+    lastTrial: state?.lastTrial,
+    decisionRequired: state?.lastTrial?.nextObservation === null,
     nextDecision: assessment.canLock
       ? "Declared checks permit a proposal, not verified truth. Request human review after any concrete remaining boundary check."
-      : "Give a concise checkpoint: what remains unresolved, which specific observable evidence could resolve it, and the next action. Use one genuinely useful inspection (name its condition and expected visible distinction), submit an unresolved low-confidence proposal for human review, or ask clarification and pause. Rephrasing/zoom is not new evidence; invisible/occluded parts cannot establish a required attribute or pose. Do not repeat a narrative search or call a preview verified.",
-    limitation: "Counts track declared support changes and source actions only, not semantic progress or visual truth. No view cap or automatic approval.",
+      : "Use tools only when a specific remaining difficulty has a plausible observable test. Assess the result: useful, inconclusive, contradictory or failed; keep what remains unknown explicit. An unsuccessful trial can be reasonable, and a distinct hypothesis or recovery can justify another observation. If no useful next observation remains, submit an unresolved low-confidence proposal for human review, or ask clarification and pause. Rewording, tool switching and rendered pixels alone establish no support; never call a preview verified.",
+    limitation: "Counts track declared support changes and source actions only, not semantic progress or visual truth. No view cap or automatic approval. Stable support, repeated actions and tool success do not determine usefulness; lastTrial is the model’s assessment, not verified truth.",
   };
 }
