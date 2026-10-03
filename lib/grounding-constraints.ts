@@ -1,3 +1,5 @@
+import { assessGroundingCandidateProvenance, type GroundingCandidateProvenanceContext, type GroundingCandidateGeometryIssue } from "./grounding-candidate-provenance";
+
 /**
  * A model-declared grounding contract, not an object recognizer or language
  * parser. The runtime checks its structure, original-query anchor and geometry;
@@ -11,6 +13,8 @@ export type GroundingConstraintCandidate = {
   id: string;
   /** Full visible-source normalized edges, never display/crop coordinates. */
   bbox: GroundingConstraintBox;
+  /** Explicit reference to the current-record visible view used for this bbox. */
+  measurementViewId?: string;
   identity: GroundingSupport & {
     label: string;
     basis: "visual_structure" | "pixel_measurement" | "repeated_view" | "unknown";
@@ -89,6 +93,8 @@ export type GroundingOrderAssessment = {
   /** Range among declared candidates, not a claim that the scene is exhaustive. */
   selectedRankRange?: [number, number];
   tiedCandidateIds: string[];
+  /** Runtime-resolved evidence; never accepted from a model contract. */
+  geometryIssues: GroundingCandidateGeometryIssue[];
 };
 
 export type GroundingConstraintAssessment = {
@@ -193,7 +199,7 @@ export function validateGroundingConstraintContract(input: unknown, originalQuer
   }
   const candidates = list(value.candidates, "candidates", GROUNDING_CONSTRAINT_LIMITS.candidates).map((input, index) => {
     const field = `candidates[${index}]`;
-    const candidate = object(input, field, ["id", "bbox", "identity"]);
+    const candidate = object(input, field, ["id", "bbox", "identity", "measurementViewId"]);
     const identity = object(candidate.identity, `${field}.identity`, ["label", "status", "evidence", "basis"]);
     const basis = identity.basis;
     if (basis !== "visual_structure" && basis !== "pixel_measurement" && basis !== "repeated_view" && basis !== "unknown") {
@@ -202,6 +208,7 @@ export function validateGroundingConstraintContract(input: unknown, originalQuer
     return {
       id: identifier(candidate.id, `${field}.id`),
       bbox: box(candidate.bbox, `${field}.bbox`),
+      ...(Object.hasOwn(candidate, "measurementViewId") ? { measurementViewId: identifier(candidate.measurementViewId, `${field}.measurementViewId`) } : {}),
       identity: {
         label: text(identity.label, `${field}.identity.label`, GROUNDING_CONSTRAINT_LIMITS.textCharacters),
         status: status(identity.status, `${field}.identity.status`),
@@ -311,6 +318,7 @@ export function assessGroundingSpatialOrder(
   order: GroundingSpatialOrder,
   candidates: readonly GroundingConstraintCandidate[],
   interpretationId = "",
+  provenanceContext?: GroundingCandidateProvenanceContext,
 ): GroundingOrderAssessment {
   unique(candidates.map((candidate) => candidate.id), "candidates");
   unique(order.candidateIds, "spatialOrder.candidateIds");
@@ -326,21 +334,24 @@ export function assessGroundingSpatialOrder(
   });
   const possible = members.filter((item) => item.identity.status !== "contradicted")
     .sort((a, b) => coordinate(a) - coordinate(b) || a.id.localeCompare(b.id));
-  const supported = possible.filter(establishedIdentity);
+  const geometryIssues = assessGroundingCandidateProvenance(members, provenanceContext);
+  const geometryResolved = geometryIssues.length === 0;
+  const unresolvedGeometryIds = new Set(geometryIssues.map((issue) => issue.candidateId));
+  const supported = possible.filter((candidate) => establishedIdentity(candidate) && !unresolvedGeometryIds.has(candidate.id));
   const selected = possible.find((item) => item.id === order.selectedCandidateId);
-  const tied = selected ? possible.filter((item) => item.id !== selected.id && Math.abs(coordinate(item) - coordinate(selected)) <= ORDER_EPSILON) : [];
-  const range: [number, number] | undefined = selected ? [
+  const tied = selected && geometryResolved ? possible.filter((item) => item.id !== selected.id && Math.abs(coordinate(item) - coordinate(selected)) <= ORDER_EPSILON) : [];
+  const range: [number, number] | undefined = selected && geometryResolved ? [
     1 + supported.filter((item) => coordinate(item) < coordinate(selected) - ORDER_EPSILON).length,
     1 + possible.filter((item) => item.id !== selected.id && coordinate(item) <= coordinate(selected) + ORDER_EPSILON).length,
   ] : undefined;
-  const selectedRank = selected && establishedIdentity(selected) && supported.length === possible.length && tied.length === 0
+  const selectedRank = geometryResolved && selected && establishedIdentity(selected) && supported.length === possible.length && tied.length === 0
     ? possible.findIndex((item) => item.id === selected.id) + 1 : undefined;
   return {
     interpretationId, axis: order.axis, direction: order.direction, ordinal: order.ordinal,
-    orderedCandidateIds: possible.map((item) => item.id), supportedCandidateIds: supported.map((item) => item.id),
+    orderedCandidateIds: geometryResolved ? possible.map((item) => item.id) : [], supportedCandidateIds: supported.map((item) => item.id),
     supportedCount: supported.length, possibleCount: possible.length, selectedCandidateId: order.selectedCandidateId,
     ...(selectedRank === undefined ? {} : { selectedRank }), ...(range ? { selectedRankRange: range } : {}),
-    tiedCandidateIds: tied.map((item) => item.id),
+    tiedCandidateIds: tied.map((item) => item.id), geometryIssues,
   };
 }
 
@@ -353,6 +364,7 @@ export function assessGroundingConstraints(
   contract: GroundingConstraintContract | undefined,
   originalQuery: string,
   selectionBbox?: readonly number[],
+  provenanceContext?: GroundingCandidateProvenanceContext,
 ): GroundingConstraintAssessment {
   const issues: GroundingConstraintIssue[] = [];
   const orders: GroundingOrderAssessment[] = [];
@@ -396,7 +408,7 @@ export function assessGroundingConstraints(
   }
   for (const interpretation of contract.interpretations) {
     const order = interpretation.spatialOrder;
-    const assessment = order ? assessGroundingSpatialOrder(order, contract.candidates, interpretation.id) : undefined;
+    const assessment = order ? assessGroundingSpatialOrder(order, contract.candidates, interpretation.id, provenanceContext) : undefined;
     if (assessment) orders.push(assessment);
     // Rejected alternative readings remain visible without invalidating a
     // supported reading. Their rejection evidence is required by the schema.
@@ -409,9 +421,10 @@ export function assessGroundingConstraints(
     if (!order || !assessment) continue;
     inspectSupport(order.candidateSet, "candidate_set_unresolved", `Candidate membership/completeness for reading ${interpretation.id}`);
     if (order.selectedCandidateId !== contract.selectedCandidateId) issue("selected_candidate_mismatch", `Reading ${interpretation.id} selects ${order.selectedCandidateId}, but the contract selects ${contract.selectedCandidateId ?? "none"}.`, true);
-    if (!assessment.orderedCandidateIds.includes(order.selectedCandidateId)) issue("selected_candidate_not_in_order", `Selected candidate ${order.selectedCandidateId} is absent from the viable ordering set.`, true);
+    for (const geometryIssue of assessment.geometryIssues) issue("ordering_geometry_unresolved", `Reading ${interpretation.id}: ${geometryIssue.message}`);
+    if (!order.candidateIds.includes(order.selectedCandidateId) || contract.candidates.find((candidate) => candidate.id === order.selectedCandidateId)?.identity.status === "contradicted") issue("selected_candidate_not_in_order", `Selected candidate ${order.selectedCandidateId} is absent from the viable ordering set.`, true);
     if (assessment.possibleCount < order.ordinal) issue("insufficient_candidates", `Reading ${interpretation.id} requests rank ${order.ordinal}, but only ${assessment.possibleCount} possible candidates (${assessment.supportedCount} supported) are declared. Do not relabel the last visible candidate as the missing rank or invent hidden members. Inspect further only for a specific observed ambiguity; otherwise submit unresolved for human review, or use grounding_evidence clarification to ask about the missing referent without proposing a box.`);
-    if (assessment.supportedCount !== order.candidateIds.length) issue("ordering_identity_unresolved", `Reading ${interpretation.id} has unresolved, contradicted or measurement-only candidate identities; they cannot establish the requested count/order.`);
+    if (order.candidateIds.some((id) => !establishedIdentity(contract.candidates.find((candidate) => candidate.id === id)!))) issue("ordering_identity_unresolved", `Reading ${interpretation.id} has unresolved, contradicted or measurement-only candidate identities; they cannot establish the requested count/order.`);
     if (assessment.tiedCandidateIds.length > 0) issue("spatial_tie", `Selected candidate ${order.selectedCandidateId} has indistinguishable ${order.axis}-centers with ${assessment.tiedCandidateIds.join(", ")}; no unique requested rank is established.`);
     if (assessment.selectedRank !== undefined && assessment.selectedRank !== order.ordinal) {
       issue("rank_mismatch", `Source-center geometry places ${order.selectedCandidateId} at rank ${assessment.selectedRank}, not requested rank ${order.ordinal}, among the declared candidates.`,

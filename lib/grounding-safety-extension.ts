@@ -23,7 +23,8 @@ import { buildGroundingComparison, groundingCandidateGeometry, groundingBoundary
 import { compactGroundingEvidence, validateGroundingWorkingState, GROUNDING_MAX_PINNED_VIEWS, type GroundingEvidenceImageBlock, type GroundingWorkingState } from "./grounding-evidence";
 import { assessGroundingConstraints, validateGroundingConstraintContract, GROUNDING_CONSTRAINT_LIMITS,
   type GroundingConstraintContract, type GroundingConstraintAssessment } from "./grounding-constraints";
-import { advanceGroundingDecision, groundingDecisionCheckpoint, type GroundingDecisionProgress } from "./grounding-decision-checkpoint";
+import { redundantGroundingRegions, type GroundingInspectionRegion, type GroundingInspectionTest } from "./grounding-inspection-gate";
+import { advanceGroundingDecision, groundingConditionSignature, groundingDecisionCheckpoint, type GroundingDecisionProgress } from "./grounding-decision-checkpoint";
 import { createGroundingGenerationControl } from "./grounding-generation-control";
 import { withGroundingContextAnchor } from "./grounding-context-anchor";
 import { applyGroundingPromptOptions } from "./grounding-prompt";
@@ -168,6 +169,7 @@ const groundingContractSchema = Type.Object({
   candidates: Type.Array(Type.Object({
     id: contractIdSchema,
     bbox: Type.Array(Type.Number(), { minItems: 4, maxItems: 4, description: "Full visible-source normalized candidate box" }),
+    measurementViewId: Type.Optional(Type.String({ maxLength: 80, description: "Current-record visible viewId where this actual object bbox was measured. Required for spatial ordering; infrared/depth and ROI labels cannot supply visible rank." })),
     identity: Type.Object({ label: contractTextSchema, status: supportStatusSchema, evidence: supportEvidenceSchema,
       basis: Type.Union([Type.Literal("visual_structure"), Type.Literal("pixel_measurement"), Type.Literal("repeated_view"), Type.Literal("unknown")]) }),
   }), { maxItems: GROUNDING_CONSTRAINT_LIMITS.candidates }),
@@ -228,6 +230,7 @@ type LoadedBatchRecord = {
   archivedViewIds: Set<string>;
   workingState?: GroundingWorkingState;
   decisionProgress?: GroundingDecisionProgress;
+  inspectionTests?: Set<string>;
   inspectionHistory?: Array<{ signature: string; viewIds: string[]; imageSignature: string; retained: boolean }>;
   processedPreview?: {
     signature: string;
@@ -375,6 +378,7 @@ type GroundingViewDetails = ReturnType<typeof groundingTargetReminder> & {
   currentBbox: [number, number, number, number] | null;
   modality: GroundingModality;
   reason: string;
+  informationNovelty?: "reused_source_pixels";
   inputCoordinateSpace?: "source" | "source_pixels" | "view_pixels" | "view_normalized";
   image: GroundingImage["details"];
   viewId?: string;
@@ -893,8 +897,9 @@ function assessOriginalQueryConstraints(
   contract: GroundingConstraintContract | undefined,
   originalQuery: string,
   bbox?: readonly number[],
+  views?: GroundingViewRegistry,
 ): GroundingConstraintAssessment {
-  const assessment = assessGroundingConstraints(contract, originalQuery, bbox);
+  const assessment = assessGroundingConstraints(contract, originalQuery, bbox, views);
   const ordinalHint = expectedGroundingOrdinal(originalQuery);
   if (!contract || groundingOrdinalHints(originalQuery).length === 0) return assessment;
   // This narrow existing hint can catch an omitted/changed numeric constraint;
@@ -2007,7 +2012,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         const anchored = withGroundingContextAnchor(messages, current ? {
           key: loadedBatchRecords.keys().next().value!, originalQuery: current.record.query ?? "",
           state: current.workingState, awaitingClarification: current.awaitingClarification,
-          decisionCheckpoint: groundingDecisionCheckpoint(current.workingState, assessOriginalQueryConstraints(current.workingState?.contract, current.record.query ?? "", current.currentBbox), current.decisionProgress),
+          decisionCheckpoint: groundingDecisionCheckpoint(current.workingState, assessOriginalQueryConstraints(current.workingState?.contract, current.record.query ?? "", current.currentBbox, current.views), current.decisionProgress),
         } : undefined, !current && lastJob ? {
           ...lastJob, pendingKey: persistedPending?.key ?? null,
           lastApprovedKey: lastApprovedKey ?? null,
@@ -2225,7 +2230,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           loaded.workingState = { ...loaded.workingState, contract };
         }
         const rawBbox = proposedBbox;
-        const constraintAssessment = assessOriginalQueryConstraints(loaded.workingState?.contract, loaded.record.query ?? "", rawBbox);
+        const constraintAssessment = assessOriginalQueryConstraints(loaded.workingState?.contract, loaded.record.query ?? "", rawBbox, loaded.views);
         const unresolved = !constraintAssessment.canLock;
         if (unresolved && loaded.workingState?.selection?.status === "locked") {
           loaded.workingState = { ...loaded.workingState, selection: { ...loaded.workingState.selection, status: "reconsidering" } };
@@ -2498,11 +2503,11 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       // Inline observations use the same validator and lock assessment as the notebook.
       // This saves a model/tool round trip; it does not infer identity from geometry.
       const applyInlineState = (loaded: LoadedBatchRecord, input: unknown) => {
-        if (input === undefined) return loaded;
-        loaded = { ...loaded };
+        if (input === undefined) return { ...loaded, inspectionTests: new Set(loaded.inspectionTests) };
+        loaded = { ...loaded, inspectionTests: new Set(loaded.inspectionTests) };
         const patch = validateGroundingWorkingState(input, loaded.record.query ?? "");
         let state = { ...loaded.workingState, ...patch };
-        const assessment = assessOriginalQueryConstraints(state.contract, loaded.record.query ?? "", state.selection?.bbox);
+        const assessment = assessOriginalQueryConstraints(state.contract, loaded.record.query ?? "", state.selection?.bbox, loaded.views);
         if (state.selection?.status === "locked" && !assessment.canLock) {
           state = { ...state, selection: { ...state.selection, status: "reconsidering" } };
         }
@@ -2513,7 +2518,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
       const inlineStateReceipt = (loaded: LoadedBatchRecord, input: unknown) => input === undefined ? {} : {
         inlineStateUpdate: { saved: true, fields: Object.keys(input as object),
           selection: loaded.workingState?.selection,
-          constraintAssessment: assessOriginalQueryConstraints(loaded.workingState?.contract, loaded.record.query ?? "", loaded.workingState?.selection?.bbox) },
+          constraintAssessment: assessOriginalQueryConstraints(loaded.workingState?.contract, loaded.record.query ?? "", loaded.workingState?.selection?.bbox, loaded.views) },
       };
       const ensureInspectionCurrent = (key: string, loaded: LoadedBatchRecord, state: GroundingWorkingState | undefined, bbox: LoadedBatchRecord["currentBbox"]) => {
         if (!active || pendingClarification() || savingRecord || loadedBatchRecords.get(key) !== loaded || loaded.workingState !== state || loaded.currentBbox !== bbox) {
@@ -2524,24 +2529,43 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         // Do not overwrite concurrently updated pin/archive/review bookkeeping.
         original.workingState = staged.workingState;
         original.currentBbox = staged.currentBbox;
+        original.inspectionTests = staged.inspectionTests;
       };
       const rememberInspection = (loaded: LoadedBatchRecord, signature: string, content: GroundingToolContent[], details: { evidenceViewIds?: string[]; convergence?: ReturnType<typeof groundingDecisionCheckpoint> }) => {
         const inspection = { signature, viewIds: details.evidenceViewIds ?? [], imageSignature: inspectionImageSignature(content, details), retained: false };
-        loaded.inspectionHistory = [...(loaded.inspectionHistory ?? []).filter((item) => item.signature !== signature), inspection].slice(-12);
+        loaded.inspectionHistory = [...(loaded.inspectionHistory ?? []).filter((item) => item.signature !== signature), inspection];
         loaded.decisionProgress = advanceGroundingDecision(loaded.decisionProgress, loaded.workingState, signature);
-        details.convergence = groundingDecisionCheckpoint(loaded.workingState, assessOriginalQueryConstraints(loaded.workingState?.contract, loaded.record.query ?? "", loaded.currentBbox), loaded.decisionProgress);
+        details.convergence = groundingDecisionCheckpoint(loaded.workingState, assessOriginalQueryConstraints(loaded.workingState?.contract, loaded.record.query ?? "", loaded.currentBbox, loaded.views), loaded.decisionProgress);
       };
-      const inspectionCheckpoint = (loaded: LoadedBatchRecord, request: unknown, reason: string, intent?: string) => {
-        // The caller passes source geometry, not display scale or labels. A prose
-        // rewrite alone cannot turn retained pixels into a novel inspection.
-        const signature = JSON.stringify(request);
-        const previous = loaded.inspectionHistory?.find((item) => item.signature === signature && item.retained);
-        const recovery = intent === "recover_evidence" || previous?.viewIds.some((id) => loaded.archivedViewIds.has(id));
-        const checkpoint = previous?.signature === signature && previous.retained && !recovery && !intent
-          ? { repeatedInspection: true, requestedQuestion: reason.trim(), priorViewIds: previous.viewIds,
-            decisionCheckpoint: "This source action repeats retained evidence; rewording a reason or changing zoom does not add evidence. No new image was generated. The prior pixels are retained in the current projected context; reuse that view. Name an unresolved condition and the observable distinction needed to resolve it; choose new source evidence, submit a supported or unresolved proposal for human review, or ask grounding_evidence clarification and pause. For unavailable pixels, boundary/part measurement or visible counterevidence, declare inspectionIntent and the specific reason; no extra notebook call is required. This is a mechanical repeat check, not an identity assessment." }
-          : undefined;
-        return { signature, checkpoint };
+      const inspectionCheckpoint = (loaded: LoadedBatchRecord, regions: GroundingInspectionRegion[], reason: string, intent?: string, test?: GroundingInspectionTest) => {
+        const signature = JSON.stringify([...regions].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))));
+        const inspectedIds = new Set(loaded.inspectionHistory?.flatMap((item) => item.viewIds) ?? []);
+        const isRetained = (id: string) => !loaded.archivedViewIds.has(id)
+          && Boolean(loaded.inspectionHistory?.some((item) => item.retained && item.viewIds.includes(id)));
+        const previousViews = loaded.views.list().filter((view) => inspectedIds.has(view.id)).reverse()
+          .sort((a, b) => Number(isRetained(b.id)) - Number(isRetained(a.id)));
+        const matches = redundantGroundingRegions(regions, previousViews);
+        if (!matches.length || matches.some((view) => !view)) return { signature };
+        const priorViewIds = [...new Set(matches.map((view) => view!.id))];
+        const retained = priorViewIds.every((id) => !loaded.archivedViewIds.has(id)
+          && loaded.inspectionHistory?.some((item) => item.retained && item.viewIds.includes(id)));
+        if (!retained && !priorViewIds.some((id) => loaded.archivedViewIds.has(id))) return { signature, reusedInformation: true };
+        const assessment = assessOriginalQueryConstraints(loaded.workingState?.contract, loaded.record.query ?? "", loaded.currentBbox, loaded.views);
+        const convergence = groundingDecisionCheckpoint(loaded.workingState, assessment, loaded.decisionProgress);
+        const validConditions = new Set([...convergence.unresolvedConditions.map((item) => item.condition), ...assessment.issues.map((item) => item.code),
+          ...(!loaded.workingState?.contract ? ["query"] : []), ...(assessment.canLock ? ["boundary"] : [])]);
+        const testKey = JSON.stringify([test?.condition, intent, groundingConditionSignature(loaded.workingState)]);
+        const concreteTest = test && validConditions.has(test.condition) && test.observable.trim().length >= 8;
+        if (intent === "recover_evidence" && !retained) return { signature, reusedInformation: true };
+        if (concreteTest && (intent === "boundary_or_part" || intent === "counterevidence") && !loaded.inspectionTests?.has(testKey)) {
+          loaded.inspectionTests ??= new Set();
+          loaded.inspectionTests.add(testKey);
+          return { signature, reusedInformation: true };
+        }
+        return { signature, checkpoint: { repeatedInspection: true, requestedQuestion: reason.trim(), priorViewIds,
+          retainedPixels: retained, informationNovelty: "reused_source_pixels", unresolvedConditions: convergence.unresolvedConditions,
+          decisionCheckpoint: "No new image generated: this region repeats adequately resolved source pixels. Reuse retained evidence. For a specific unresolved boundary or counterevidence test, supply inspectionIntent and inspectionTest {condition: unresolved requirement ID or issue code, observable: concrete visible distinction}; use condition query before a contract exists or boundary for a supported target’s final edge check. Rewording, bbox shifts, zoom and archive do not resolve a condition. If pixels are unavailable, use recover_evidence; recovery is not new information. Otherwise submit an unresolved low-confidence proposal for human review, or ask clarification and pause. Invisible evidence remains unresolved.",
+        } };
       };
 
       // Optional model-visible inspection using the exact same coordinate
@@ -2561,7 +2585,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         }
         const contract = params.contract === undefined ? loaded.workingState?.contract
           : validateGroundingConstraintContract(params.contract, loaded.record.query ?? "");
-        const constraintAssessment = assessOriginalQueryConstraints(contract, loaded.record.query ?? "", bbox);
+        const constraintAssessment = assessOriginalQueryConstraints(contract, loaded.record.query ?? "", bbox, loaded.views);
         const visible = await loadGroundingImage(loaded.sourcePath, loaded.record, "visible", readRecordImage, null, "none");
         const overlay = await renderGroundingOverlay(visible, bbox, `${key} | UNSAVED PROPOSAL`);
         const proposal: GroundingImage = {
@@ -2936,7 +2960,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           "Keep the original query and the user's target requirements intact in state.target; put changing candidate identities in hypotheses, not in place of the requested target. Record hypotheses, open questions and ruled-out candidates concisely, not private deliberation. An evidence update is not required for every crop; use another view only for a concrete unresolved question.",
           "state is a partial update: omitted fields, including selection and contract, are preserved. Supplied arrays replace their previous values; use [] to clear a list. Supply a complete selection with status and evidence to change the target lock.",
           "Before locking, record state.contract; when ready to submit, you may instead attach contract directly to the save call. Omit originalQuery to use the exact loaded query; any supplied value must match it. Keep queryCoverage, plausible interpretations with requirements[].queryText, candidate IDs/source boxes and identity evidence. queryText belongs inside requirements, not interpretations. Preserve conflicting readings rather than silently choosing one. Support remains a declaration, not a machine proof.",
-          "For ordered targets each interpretation declares spatialOrder axis (x/y), direction (ascending is left-to-right/top-to-bottom, descending the reverse), ordinal and candidateIds. Keep the total serialized contract at most 32 KiB and queryText excerpts at most 600 characters; shorten evidence, never the original query. The runtime sorts source centers independently of discovery/array order. Declare candidateSet unresolved if membership/count is uncertain. Identity basis is visual_structure only for actual visible structure; repeated_view/pixel_measurement cannot prove identity. Alternatives rejected by evidence stay as contradicted interpretations.",
+          "For ordered targets each candidate must include measurementViewId from an actual current-record visible view covering its measured object bbox. A source-like bbox alone, an infrared/depth view, or a region label cannot establish visible order. Each interpretation declares spatialOrder axis (x/y), direction (ascending is left-to-right/top-to-bottom, descending the reverse), ordinal and candidateIds. Keep the total serialized contract at most 32 KiB and queryText excerpts at most 600 characters; shorten evidence, never the original query. The runtime sorts source centers independently of discovery/array order. Declare candidateSet unresolved if membership/count is uncertain. Identity basis is visual_structure only for actual visible structure; repeated_view/pixel_measurement cannot prove identity. Alternatives rejected by evidence stay as contradicted interpretations.",
           "Missing or unresolved contracts stay reviewable as unresolved at low confidence; no extra color/crop call is required. Unsupported locks are returned as reconsidering with explicit constraintAssessment issues. Fix only what current evidence supports; never fabricate evidence to clear a check.",
           "If the referent or requested rank cannot be established and there is no concrete remaining visual check, pass clarification with one specific question for the user. This ends the current run and waits on the same unsaved record without requiring a box. A real user response releases the wait; it never approves, saves or advances. Use ordinary unresolved human review instead when a best-supported proposal is useful.",
           "As soon as identity and every required order/relation are established, set state.selection to locked with a rough source-normalized bbox and direct evidence. Locked means no identity or rank check remains; it is not a tentative pick. This limits later views to target boundary measurement. Use reconsidering while comparison is still needed or after naming new visible counterevidence; a generic possibility of hidden candidates is not counterevidence.",
@@ -2973,7 +2997,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           const patch = params.state === undefined ? undefined : validateGroundingWorkingState(params.state, loaded.record.query ?? "");
           let state = patch === undefined ? loaded.workingState : { ...loaded.workingState, ...patch };
           if (state?.contract) validateGroundingConstraintContract(state.contract, loaded.record.query ?? "");
-          const constraintAssessment = assessOriginalQueryConstraints(state?.contract, loaded.record.query ?? "", state?.selection?.bbox);
+          const constraintAssessment = assessOriginalQueryConstraints(state?.contract, loaded.record.query ?? "", state?.selection?.bbox, loaded.views);
           const lockDeferred = state?.selection?.status === "locked" && !constraintAssessment.canLock;
           if (lockDeferred && state?.selection) {
             state = { ...state, selection: { ...state.selection, status: "reconsidering" } };
@@ -3059,6 +3083,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         ],
         parameters: Type.Object({
           state: Type.Optional(groundingInlineStateSchema),
+          inspectionTest: Type.Optional(Type.Object({ condition: Type.String({ minLength: 1, maxLength: 160, description: "Unresolved requirement ID or assessment issue code; use query before a contract exists, boundary for a supported target’s final edge check" }), observable: Type.String({ minLength: 8, maxLength: 400, description: "Specific visible distinction this test can resolve. Invisible or occluded evidence stays unresolved." }) })),
           inspectionIntent: Type.Optional(Type.Union([Type.Literal("boundary_or_part"), Type.Literal("counterevidence"), Type.Literal("recover_evidence")], { description: "Explicit reason to revisit identical pixels. Explain the concrete question in reason; never claim new source evidence from a rerender." })),
           key: Type.Optional(Type.String()), queryPath: Type.Optional(Type.String()),
           modality: Type.Optional(Type.Union([Type.Literal("visible"), Type.Literal("infrared"), Type.Literal("depth")])),
@@ -3090,14 +3115,14 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             return { id: String.fromCharCode(65 + index), modality: sensor, label: `[${sensor}] ${item.label}`,
               region: validateBoundingBox(item.region), bbox: item.bbox ? validateBoundingBox(item.bbox) : undefined };
           });
-          const inspection = inspectionCheckpoint(loaded, { tool: "compare", regions: regions.map(({ modality, region, bbox }) => ({ modality, region, bbox })) }, params.reason, params.inspectionIntent);
+          const inspection = inspectionCheckpoint(loaded, regions.map(({ modality, region }) => ({ modality, region, displayBounds: [regions.length === 1 ? 1568 : 776, regions.length <= 2 ? 540 : 500] as [number, number] })), params.reason, params.inspectionIntent, params.inspectionTest);
           if (inspection.checkpoint) {
             ensureInspectionCurrent(key, originalLoaded, initialWorkingState, initialBbox);
             commitInspectionState(originalLoaded, loaded);
             persistJob();
             originalLoaded.decisionProgress = advanceGroundingDecision(originalLoaded.decisionProgress, originalLoaded.workingState, inspection.signature);
             const details = { ...groundingTargetReminder(loaded), ...inspection.checkpoint,
-              convergence: groundingDecisionCheckpoint(loaded.workingState, assessOriginalQueryConstraints(loaded.workingState?.contract, loaded.record.query ?? "", loaded.currentBbox), originalLoaded.decisionProgress),
+              convergence: groundingDecisionCheckpoint(loaded.workingState, assessOriginalQueryConstraints(loaded.workingState?.contract, loaded.record.query ?? "", loaded.currentBbox, loaded.views), originalLoaded.decisionProgress),
               ...inlineStateReceipt(loaded, params.state) };
             return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
           }
@@ -3146,7 +3171,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           commitInspectionState(originalLoaded, loaded);
           persistJob();
           const repeatedPanels = panels.filter((panel) => panel.sourceReuse);
-          const details = { key, ...groundingTargetReminder(loaded), ...inlineStateReceipt(loaded, params.state), modality: sourceGeometryByModality.length === 1 ? overviewModality : "mixed", reason: params.reason, overview: overviewView, panels,
+          const details = { key, ...(inspection.reusedInformation ? { informationNovelty: "reused_source_pixels" } : {}), ...groundingTargetReminder(loaded), ...inlineStateReceipt(loaded, params.state), modality: sourceGeometryByModality.length === 1 ? overviewModality : "mixed", reason: params.reason, overview: overviewView, panels,
             ...(sourceGeometryByModality.length === 1 ? { sourceGeometry: sourceGeometryByModality[0] } : {}),
             sourceGeometryByModality,
             evidenceImageBlocks: [{ imageIndex: 0, viewIds: [overviewView.id, ...panels.map((view) => view.id)] }],
@@ -3181,6 +3206,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
         ],
         parameters: Type.Object({
           state: Type.Optional(groundingInlineStateSchema),
+          inspectionTest: Type.Optional(Type.Object({ condition: Type.String({ minLength: 1, maxLength: 160, description: "Unresolved requirement ID or assessment issue code; use query before a contract exists, boundary for a supported target’s final edge check" }), observable: Type.String({ minLength: 8, maxLength: 400, description: "Specific visible distinction this test can resolve. Invisible or occluded evidence stays unresolved." }) })),
           inspectionIntent: Type.Optional(Type.Union([Type.Literal("boundary_or_part"), Type.Literal("counterevidence"), Type.Literal("recover_evidence")], { description: "Explicit reason to revisit identical pixels. Explain the concrete question in reason; never claim new source evidence from a rerender." })),
           queryPath: Type.Optional(Type.String({ description: "Source queries.json; defaults to the loaded record's dataset" })),
           key: Type.Optional(Type.String({ description: "Record key; defaults to the currently loaded record" })),
@@ -3278,20 +3304,22 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
               ? recalled.region
               : undefined;
           }
-          if (selected && !requestedRegion && modality === "visible" && loaded.grantedModalities.has("visible")) {
+          // Explicit recovery must reach the evidence-availability gate below: a lock
+          // does not guarantee that the overview pixels survived context projection.
+          if (selected && !requestedRegion && modality === "visible" && loaded.grantedModalities.has("visible")
+            && params.inspectionIntent !== "recover_evidence") {
             throw new Error(
               "The visible overview is already available and the target is selected. Inspect a crop intersecting that target or submit it for review.",
             );
           }
-          const inspection = inspectionCheckpoint(loaded, { tool: "view", modality, requestedRegion: requestedRegion ?? [0, 0, 1, 1],
-            decorations, currentBbox }, params.reason, params.inspectionIntent);
+          const inspection = inspectionCheckpoint(loaded, [{ modality, region: requestedRegion ?? [0, 0, 1, 1] }], params.reason, params.inspectionIntent, params.inspectionTest);
           if (inspection.checkpoint) {
             ensureInspectionCurrent(key, originalLoaded, initialWorkingState, initialBbox);
             commitInspectionState(originalLoaded, loaded);
             persistJob();
             originalLoaded.decisionProgress = advanceGroundingDecision(originalLoaded.decisionProgress, originalLoaded.workingState, inspection.signature);
             const details = { ...groundingTargetReminder(loaded), ...inspection.checkpoint,
-              convergence: groundingDecisionCheckpoint(loaded.workingState, assessOriginalQueryConstraints(loaded.workingState?.contract, loaded.record.query ?? "", loaded.currentBbox), originalLoaded.decisionProgress),
+              convergence: groundingDecisionCheckpoint(loaded.workingState, assessOriginalQueryConstraints(loaded.workingState?.contract, loaded.record.query ?? "", loaded.currentBbox, loaded.views), originalLoaded.decisionProgress),
               ...inlineStateReceipt(loaded, params.state) };
             return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
           }
@@ -3319,7 +3347,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             commitInspectionState(originalLoaded, loaded);
             persistJob();
             const details: GroundingViewDetails = {
-              key,
+              key, ...(inspection.reusedInformation ? { informationNovelty: "reused_source_pixels" as const } : {}),
               ...targetReminder,
               action: "crop",
               currentBbox,
@@ -3336,7 +3364,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
             rememberInspection(originalLoaded, inspection.signature, [...(overview?.content ?? []), ...image.content], details);
             return {
               content: [
-                { type: "text" as const, text: JSON.stringify({ key, ...targetReminder, focused: modality, currentBbox, viewId: view.id, requestedZoom: zoom, convergence: details.convergence,
+                { type: "text" as const, text: JSON.stringify({ key, ...targetReminder, focused: modality, currentBbox, viewId: view.id, requestedZoom: zoom, convergence: details.convergence, informationNovelty: details.informationNovelty,
                   ...(bboxAsRegion ? { inputNormalization: "bbox+zoom without region was used only as the crop region; target bbox unchanged. Prefer region+reason." } : {}),
                   reason: params.reason, ...(inputCoordinateSpace ? { inputCoordinateSpace } : {}), ...(view.sourceReuse ? { sourceReuse: view.sourceReuse,
                     decisionCheckpoint: "This rendering mostly reuses prior source pixels. Reuse the existing view when sufficient; another crop may resolve a distinct boundary or part question without an extra evidence checkpoint." } : {}) }) },
@@ -3357,7 +3385,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           commitInspectionState(originalLoaded, loaded);
           persistJob();
           const details: GroundingViewDetails = {
-            key,
+            key, ...(inspection.reusedInformation ? { informationNovelty: "reused_source_pixels" as const } : {}),
             ...targetReminder,
             action: "view",
             currentBbox,
@@ -3372,7 +3400,7 @@ export function createGroundingSafetyExtension(options: GroundingSafetyOptions):
           rememberInspection(originalLoaded, inspection.signature, image.content, details);
           return {
             content: [
-              { type: "text" as const, text: JSON.stringify({ key, ...targetReminder, viewed: modality, currentBbox, viewId: view.id, reason: params.reason, convergence: details.convergence,
+              { type: "text" as const, text: JSON.stringify({ key, ...targetReminder, viewed: modality, currentBbox, viewId: view.id, reason: params.reason, convergence: details.convergence, informationNovelty: details.informationNovelty,
                 ...(view.sourceReuse ? { sourceReuse: view.sourceReuse,
                   decisionCheckpoint: "This rendering mostly reuses prior source pixels. Reuse the existing view when sufficient; another crop may resolve a distinct boundary or part question without an extra evidence checkpoint." } : {}) }) },
               ...image.content,

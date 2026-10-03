@@ -16,10 +16,10 @@ export function groundingConditionSignature(state?: GroundingWorkingState): stri
   return JSON.stringify(contract ? {
     coverage: contract.queryCoverage.status,
     selected: contract.selectedCandidateId,
-    candidates: contract.candidates.map((item) => [item.id, item.bbox, item.identity.status, item.identity.basis]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+    candidates: contract.candidates.map((item) => [item.id, item.identity.status, item.identity.basis]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
     readings: contract.interpretations.map((item) => [item.id, item.status,
-      item.requirements.map((condition) => [condition.id, condition.queryText, condition.status]).sort((a, b) => a[0].localeCompare(b[0])),
-      item.spatialOrder ? { ...item.spatialOrder, candidateIds: [...item.spatialOrder.candidateIds].sort(), candidateSet: item.spatialOrder.candidateSet.status } : null,
+      item.requirements.map((condition) => [condition.id, condition.status]).sort((a, b) => a[0].localeCompare(b[0])),
+      item.spatialOrder ? { axis: item.spatialOrder.axis, direction: item.spatialOrder.direction, ordinal: item.spatialOrder.ordinal, selectedCandidateId: item.spatialOrder.selectedCandidateId, candidateIds: [...item.spatialOrder.candidateIds].sort(), candidateSet: item.spatialOrder.candidateSet.status } : null,
     ]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
   } : null);
 }
