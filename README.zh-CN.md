@@ -123,7 +123,7 @@ npm run lint
 
 首次装入此功能后，需要在**原来的外部启动窗口**按 `Ctrl+C` 关闭旧启动器，再运行 `.\start-web.cmd` 一次。仅重启 Web 子进程不会升级已经运行的启动器。后续即可使用 `/update`。
 
-- 只接受 `https://github.com/jiah0231/aicpi.git` 的 `origin/gptdot`，使用快进更新，不切换分支
+- 只接受 `https://github.com/jiah0231/aicpi.git` 的 `origin/gptdot`（HTTPS 地址可省略 `.git`），使用快进更新，不切换分支；会校验 Git `insteadOf` 展开后的实际地址，不接受镜像、凭据、端口或其他协议，也不会改写 `origin`
 - 保留不冲突的本地修改及未跟踪文件；冲突、分支分叉、拉取失败都会停止，不会重启，也不会 reset、clean 或 stash
 - 重启会中断所有正在执行的任务、待审核内容及内置终端，请先保存工作
 - 仅支持启动器的 `dev` 模式；如上游修改依赖文件，请在外部终端手动更新和安装依赖。命令不会安装依赖或运行构建

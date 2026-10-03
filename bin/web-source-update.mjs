@@ -11,7 +11,10 @@ export function updateCheckout(root, runGit = (args) => execFileSync("git", args
   const git = (...args) => runGit(["-c", "core.hooksPath=", "-c", "merge.autoStash=false", ...args]);
   if (realpathSync(git("rev-parse", "--show-toplevel")) !== realpathSync(root)) throw new Error("Update requires this application's own Git checkout.");
   if (git("branch", "--show-current") !== "gptdot") throw new Error("Update requires the gptdot branch; no branch was switched.");
-  if (git("remote", "get-url", "origin") !== "https://github.com/jiah0231/aicpi.git") throw new Error("Update requires origin https://github.com/jiah0231/aicpi.git; no source was changed.");
+  // get-url expands Git's insteadOf rules: validate the effective fetch URL,
+  // not just the configured spelling. Allow only equivalent GitHub HTTPS forms;
+  // no credentials, ports, query/fragment, or alternate transports.
+  if (!/^https:\/\/github\.com\/jiah0231\/aicpi(?:\.git)?$/.test(git("remote", "get-url", "origin"))) throw new Error("Update requires origin https://github.com/jiah0231/aicpi.git (optional .git suffix); no source was changed.");
   if (git("rev-parse", "--abbrev-ref", "@{upstream}") !== "origin/gptdot") throw new Error("Update requires upstream origin/gptdot.");
   // Fetch does not touch working files. A single fixed ref avoids arbitrary refs or commands.
   git("fetch", "--no-tags", "origin", "refs/heads/gptdot");
