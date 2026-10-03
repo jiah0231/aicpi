@@ -18,6 +18,7 @@ namespace PiWeb
         private static volatile bool parentClosed;
         private static string directory, runId, mode, phase;
         private static int port, generation;
+        private static bool stateWriteFailed;
         private static readonly Encoding Utf8 = new UTF8Encoding(false);
 
         public static void Run(string root, string node, string launchMode, int launchPort)
@@ -180,12 +181,35 @@ namespace PiWeb
 
         private static void State()
         {
-            long now = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
             string temporary = Path.Combine(directory, "state.tmp");
             string target = Path.Combine(directory, "state");
-            File.WriteAllText(temporary, runId + "\n" + phase + "\n" + now + "\n" + generation + "\n" + port + "\n" + mode + "\nupdate-v1\n", Utf8);
-            if (File.Exists(target)) File.Replace(temporary, target, null);
-            else File.Move(temporary, target);
+            Exception failure = null;
+            // Windows readers/scanners can briefly deny replacement. A missed
+            // heartbeat must not unwind Run() and kill a healthy owned job.
+            // Keep publication atomic: never delete/truncate the visible state.
+            for (int attempt = 0; attempt < 4; attempt++)
+            {
+                try
+                {
+                    long now = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
+                    File.WriteAllText(temporary, runId + "\n" + phase + "\n" + now + "\n" + generation + "\n" + port + "\n" + mode + "\nupdate-v1\n", Utf8);
+                    if (File.Exists(target)) File.Replace(temporary, target, null);
+                    else File.Move(temporary, target);
+                    if (stateWriteFailed) Console.Error.WriteLine("STATE RECOVERED: manager status publication resumed.");
+                    stateWriteFailed = false;
+                    return;
+                }
+                catch (IOException error) { failure = error; }
+                catch (UnauthorizedAccessException error) { failure = error; }
+                if (attempt < 3) Thread.Sleep(50 * (attempt + 1));
+            }
+            // Retry on the next heartbeat. Readers already reject stale state
+            // after 20 seconds; update requests still require the current run,
+            // generation and in-memory ready phase. Don't log through file I/O
+            // here, or a second locked file could make this warning fatal.
+            if (!stateWriteFailed) Console.Error.WriteLine("STATE WARNING: could not publish " + target +
+                "; the manager will retry without stopping the server. " + failure.Message);
+            stateWriteFailed = true;
         }
 
         private static void UpdateResult(string result)
